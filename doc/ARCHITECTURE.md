@@ -2,7 +2,7 @@
 
 ## High-Level Overview
 
-SP implements the Scalability Protocols specification in pure Go with a layered, transport-agnostic architecture. The system cleanly separates I/O concerns from protocol logic through goroutine-based workers and channel-based message passing.
+We implement the Scalability Protocols specification in pure Go with a layered, transport-agnostic architecture. We cleanly separate I/O concerns from protocol logic through goroutine-based workers and channel-based message passing.
 
 ```plantuml
 @startuml
@@ -71,150 +71,269 @@ package "Transport Layer" {
 ## Component Responsibilities
 
 ### Application Layer
-**What it does**: User code that initiates messaging operations.
 
-**Responsibilities**:
-- Calls Send() and Recv() operations
-- Handles results and errors from messaging operations
-- Application-level message framing if needed
+The application layer contains user code that initiates messaging operations. Applications call Send() and Recv() operations, handle results and errors, and perform application-level message framing if needed.
 
 ### Socket API Layer
-**What it does**: Synchronous facade over asynchronous goroutine infrastructure.
 
-**Responsibilities**:
-- Provides blocking Send(message) and Recv() → message operations
-- Converts sync calls into async goroutine-based patterns using channels
-- Manages socket lifecycle (Open, Close, Listen, Dial)
-- Error propagation from I/O and protocol layers
+The socket API layer provides a synchronous facade over asynchronous goroutine infrastructure. We provide blocking Send(message) and Recv() operations that convert sync calls into async goroutine-based patterns using channels. We manage socket lifecycle (Open, Close, Listen, Dial) and propagate errors from I/O and protocol layers.
 
 ### Protocol Engine
-**What it does**: Implements the semantics of specific Scalability Protocol patterns.
 
-**Responsibilities** (varies by pattern):
-- REQ/REP: Request tracking, reply routing, timeout handling
-- PUB/SUB: Subscriber registration, message broadcasting, subscription tracking
-- PIPELINE: Work distribution, load balancing across workers
-- SURVEY: Survey initiation, response collection, timeout
-- BUS: Peer discovery, message routing, fair distribution
-- PAIR: Point-to-point connection management, buffering
+The protocol engine implements the semantics of specific Scalability Protocol patterns.
 
-**Per-pattern goroutines**: One or more protocol goroutines manage state machines and handle messages from the I/O layer.
+Table: Protocol Engine Responsibilities
 
-### Message Router & Handoff
-**What it does**: Channels that connect protocol layer to I/O workers.
+| Pattern | Responsibilities |
+|---------|------------------|
+| REQ/REP | Request tracking, reply routing, timeout handling |
+| PUB/SUB | Subscriber registration, message broadcasting, subscription tracking |
+| PIPELINE | Work distribution, load balancing across workers |
+| SURVEY | Survey initiation, response collection, timeout |
+| BUS | Peer discovery, message routing, fair distribution |
+| PAIR | Point-to-point connection management, buffering |
 
-**Responsibilities**:
-- Receive messages from I/O workers and route to protocol logic
-- Send processed/outbound messages from protocol layer to I/O workers
-- Preserve message boundaries across handoff
-- Buffer messages if needed to prevent stalling
+One or more protocol goroutines manage state machines and handle messages from the I/O layer.
+
+### Message Router and Handoff
+
+The message router uses channels to connect the protocol layer to I/O workers. We receive messages from I/O workers and route them to protocol logic, send processed outbound messages from protocol layer to I/O workers, preserve message boundaries across handoff, and buffer messages if needed to prevent stalling.
 
 ### Shared Infrastructure
-**Message Buffer Pool**: Preallocated buffers for message payloads, reducing allocation pressure during high-throughput messaging.
 
-**Peer Registry**: Tracks connected peers, their protocol state, and subscription information.
+Table: Shared Infrastructure Components
 
-**Connection Registry**: Maps file descriptors or connection identifiers to socket state.
-
-**Synchronization Primitives**: Mutexes and RWMutex for protecting shared state (registries, pools, peer lists).
+| Component | Purpose |
+|-----------|---------|
+| Message Buffer Pool | Preallocated buffers for message payloads, reducing allocation pressure |
+| Peer Registry | Tracks connected peers, their protocol state, and subscription information |
+| Connection Registry | Maps file descriptors or connection identifiers to socket state |
+| Synchronization Primitives | Mutexes and RWMutex for protecting shared state |
 
 ### I/O Workers
-**What it does**: Raw syscall handlers for sending and receiving bytes.
 
-**Responsibilities**:
-- One recv worker per socket: reads packets/messages, frames them, delivers to protocol layer
-- One send worker per socket: batches outbound messages, flushes via syscall
-- No protocol understanding—purely mechanical I/O
-- Error handling for transport failures (EAGAIN, connection drops)
-- Preserves message boundaries at transport level (unixgram and raw IP both provide framing)
+I/O workers handle raw syscalls for sending and receiving bytes. One recv worker per socket reads packets and delivers them to the protocol layer. One send worker per socket batches outbound messages and flushes via syscall. Workers have no protocol understanding and handle transport failures (EAGAIN, connection drops). Both unixgram and raw IP preserve message boundaries.
 
 ### Transport Layer
-**Unix Domain Sockets (`unixgram`)**: Datagram-oriented IPC for local host-only communication.
-- Message boundaries: Built-in by UDP-like semantics
-- Performance: Shared memory speed, minimal overhead
-- Use case: Tight local coordination (AEON agents on same host)
 
-**Raw IP Sockets**: Datagram sockets at IP layer (no TCP).
-- Message boundaries: Built-in by IP fragmentation handling
-- Performance: Direct IP routing, no TCP overhead
-- Use case: Distributed agent networks (agents across machines)
+Table: Transport Options
+
+| Transport | Message Boundaries | Performance | Use Case |
+|-----------|-------------------|-------------|----------|
+| Unix Domain Sockets (unixgram) | Built-in via UDP-like semantics | Shared memory speed | Local coordination (AEON agents on same host) |
+| Raw IP Sockets | Built-in via IP fragmentation | Direct IP routing, no TCP overhead | Distributed networks (agents across machines) |
 
 ## Data Flow Example: REQ/REP Pattern
 
-**Scenario**: Agent A wants to ask Agent B for status, wait for reply.
+Consider this scenario where Agent A asks Agent B for status and waits for a reply.
 
-1. **Application initiates**: `client.Send(request)` blocks
-2. **Socket API**: Queues send operation to protocol goroutine
-3. **Protocol Engine (REQ side)**: 
-   - Records request ID
-   - Marks request as "awaiting reply"
-   - Queues to send worker
-4. **Send Worker**: Writes message bytes via `unixgram.SendTo()`
-5. **Peer I/O (Agent B, REC side)**:
-   - Recv worker reads bytes
-   - Delivers to protocol engine
-6. **Protocol Engine (REP side)**:
-   - Routes to application waiting in `Recv()`
-7. **Application (Agent B)**: Processes request, calls `server.Send(response)`
-8. **Protocol Engine (REP side)**: Captures source address, queues response to send worker
-9. **Send Worker**: Routes back to Agent A
-10. **Protocol Engine (REQ side)**: Matches response to request ID
-11. **Socket API (Client)**: Unblocks `Send()`, unblocks waiting `Recv()`
-12. **Application (Agent A)**: Has response
+```plantuml
+@startuml
+!theme plain
+title REQ/REP Data Flow
 
-## Key Design Decisions
+participant "Agent A\nApplication" as AppA
+participant "REQ Socket" as REQ
+participant "Transport" as T
+participant "REP Socket" as REP
+participant "Agent B\nApplication" as AppB
+
+AppA -> REQ : Send(request)
+REQ -> REQ : Record request ID\nMark awaiting reply
+REQ -> T : Queue to send worker
+T -> REP : Message bytes
+REP -> REP : Store backtrace
+REP -> AppB : Recv() returns request
+
+AppB -> REP : Send(response)
+REP -> REP : Attach backtrace
+REP -> T : Queue to send worker
+T -> REQ : Message bytes
+REQ -> REQ : Match response to request ID
+REQ -> AppA : Recv() returns response
+
+@enduml
+```
+
+## Goroutine Lifecycle
+
+We manage goroutines carefully to prevent leaks and ensure clean shutdown. Each socket spawns a fixed set of goroutines that live for the socket's lifetime.
+
+```plantuml
+@startuml
+!theme plain
+title Socket Goroutine Lifecycle
+
+participant "Application" as App
+participant "Socket API" as API
+participant "Protocol\nGoroutine" as Proto
+participant "Send\nWorker" as Send
+participant "Recv\nWorker" as Recv
+
+== Socket Creation ==
+App -> API : NewSocket()
+API -> Proto : spawn
+API -> Send : spawn
+API -> Recv : spawn
+API --> App : socket
+
+note over Proto,Recv : All goroutines block on channels\nwaiting for work
+
+== Normal Operation ==
+App -> API : Send(data)
+API -> Proto : sendCh <- msg
+Proto -> Send : outCh <- msg
+Send -> Send : syscall write
+
+Recv -> Recv : syscall read
+Recv -> Proto : inCh <- msg
+Proto -> API : recvCh <- msg
+API --> App : Recv() returns
+
+== Shutdown ==
+App -> API : Close()
+API -> API : cancel context
+API -> Proto : ctx.Done()
+API -> Send : ctx.Done()
+API -> Recv : ctx.Done()
+
+Proto -> Proto : cleanup, exit
+Send -> Send : cleanup, exit
+Recv -> Recv : cleanup, exit
+
+API --> App : Close() returns
+
+@enduml
+```
+
+Table: Goroutine Responsibilities
+
+| Goroutine | Count per Socket | Responsibility |
+|-----------|------------------|----------------|
+| Protocol | 1-2 | State machine, message routing, peer tracking |
+| Send Worker | 1 | Batching, syscall write, error handling |
+| Recv Worker | 1 | Syscall read, framing, delivery to protocol |
+
+## Error Handling
+
+We propagate errors through the layer stack and provide clear error types for each failure mode.
+
+Table: Error Categories
+
+| Category | Examples | Handling |
+|----------|----------|----------|
+| Transport errors | Connection refused, timeout, EAGAIN | Retry or propagate to application |
+| Protocol errors | Invalid state, missing peer, timeout | Return specific error to application |
+| Resource errors | Buffer exhaustion, too many peers | Reject operation with clear error |
+| Shutdown errors | Context canceled, socket closed | Return ErrClosed consistently |
+
+We use Go's error wrapping to preserve context through the stack.
+
+```go
+// Error types for protocol operations
+var (
+    ErrClosed       = errors.New("socket closed")
+    ErrTimeout      = errors.New("operation timed out")
+    ErrInvalidState = errors.New("invalid protocol state")
+    ErrNoPeer       = errors.New("no peer connected")
+    ErrBufferFull   = errors.New("buffer full")
+)
+
+// Wrapping preserves context
+return fmt.Errorf("send failed: %w", ErrTimeout)
+```
+
+## Message Format
+
+We use a simple message structure that carries data and metadata through the system.
+
+```plantuml
+@startuml
+!theme plain
+title Message Structure
+
+class Message {
+    Header []byte
+    Data []byte
+    PeerID uint32
+    Timestamp time.Time
+    --
+    Clone() *Message
+    Release()
+}
+
+note right of Message::Header
+  Protocol-specific headers:
+  - Request ID (REQ/REP)
+  - Survey ID (SURVEY)
+  - Backtrace (routing)
+end note
+
+note right of Message::Data
+  Application payload
+  (opaque bytes)
+end note
+
+note right of Message::PeerID
+  Identifies source/destination
+  for routing
+end note
+
+@enduml
+```
+
+Table: Header Formats by Protocol
+
+| Protocol | Header Content | Size |
+|----------|---------------|------|
+| REQ/REP | Request ID (MSB set) + optional peer IDs | 4+ bytes |
+| SURVEY | Survey ID (MSB set) + optional peer IDs | 4+ bytes |
+| PUB/SUB | None (topic is part of data) | 0 bytes |
+| PIPELINE | None | 0 bytes |
+| BUS | None | 0 bytes |
+| PAIR | None | 0 bytes |
+
+## Design Decisions
+
+We made six architectural decisions that shape SP.
 
 ### 1. Transport Abstraction
-**Decision**: Single Socket interface with pluggable transport backends (Unix socket vs. Raw IP).
 
-**Why**: Allows same protocol implementation to work locally (speed) or distributed (scale) without code duplication. Agent developer chooses transport at socket creation time.
-
-**Alternative rejected**: Separate implementations per transport—leads to protocol duplication and higher maintenance burden.
+We provide a single Socket interface with pluggable transport backends (Unix socket vs. Raw IP). This allows the same protocol implementation to work locally (speed) or distributed (scale) without code duplication. The agent developer chooses transport at socket creation time. We rejected separate implementations per transport because that leads to protocol duplication and higher maintenance burden.
 
 ### 2. Goroutine-Per-Socket I/O Model
-**Decision**: One recv + one send goroutine per socket, not a thread pool or reactor pattern.
 
-**Why**: Goroutines are lightweight; channels provide natural message passing. Simple to reason about: each socket's I/O is isolated. Scales to thousands of sockets without kernel thread exhaustion.
+We allocate one recv goroutine and one send goroutine per socket rather than using a thread pool or reactor pattern. Goroutines are lightweight and channels provide natural message passing. Each socket's I/O is isolated, making the system simple to reason about. We can scale to thousands of sockets without kernel thread exhaustion. We rejected the reactor/epoll-based model because it adds complexity without performance gain on modern Go schedulers and makes blocking behavior harder to debug.
 
-**Alternative rejected**: Reactor/epoll-based model—more complex, no performance gain on modern Go schedulers, harder to debug blocking behavior.
+### 3. Protocol Goroutines Per Socket
 
-### 3. Protocol Goroutine(s) Per Socket
-**Decision**: Protocol engine runs one or more goroutines per socket, separate from I/O.
-
-**Why**: I/O layer never blocks on protocol logic (prevents recv stalls if protocol is slow). Protocol logic never touches syscalls (easier testing, no wakeup complexity). Channels enforce clean handoff.
-
-**Alternative rejected**: Single goroutine per socket doing I/O and protocol—mixes concerns, makes testing harder, creates artificial coupling.
+We run one or more goroutines for the protocol engine per socket, separate from I/O. The I/O layer never blocks on protocol logic, preventing recv stalls if protocol is slow. Protocol logic never touches syscalls, making testing easier with no wakeup complexity. Channels enforce clean handoff. We rejected the single goroutine per socket doing both I/O and protocol because it mixes concerns, makes testing harder, and creates artificial coupling.
 
 ### 4. Synchronous Blocking API First
-**Decision**: Start with traditional `Send()` / `Recv()` blocking semantics before adding async API.
 
-**Why**: Simpler to reason about correctness. Traditional message patterns (request/response) map naturally to blocking calls. Easier to debug (no callback hell or goroutine lifetime mysteries).
+We start with traditional Send() and Recv() blocking semantics before adding async API. This approach is simpler to reason about for correctness. Traditional message patterns (request/response) map naturally to blocking calls. Debugging is easier without callback complexity or goroutine lifetime mysteries. Phase 2 adds async API via channels and contexts for applications that need non-blocking integration.
 
-**Phase 2 adds**: Async API via channels/contexts, for applications that need non-blocking integration.
+### 5. Channel-Based Handoff
 
-### 5. Channel-Based Handoff, Not Shared Memory
-**Decision**: Message handoff between protocol and I/O layers via channels, not shared queues with locks.
-
-**Why**: Channels are Go-native, provide backpressure naturally, prevent races. Protocol and I/O layers stay independent—can be tested in isolation.
-
-**Alternative rejected**: Shared queue + mutex—more error-prone, requires explicit synchronization, Go idiom is channels.
+We use channels for message handoff between protocol and I/O layers rather than shared queues with locks. Channels are Go-native, provide backpressure naturally, and prevent races. Protocol and I/O layers stay independent and can be tested in isolation. We rejected shared queue plus mutex because it is more error-prone, requires explicit synchronization, and violates Go idioms.
 
 ### 6. Message Boundaries as First-Class
-**Decision**: Both Unix sockets and Raw IP preserve message boundaries; never fragment or reassemble at the library level.
 
-**Why**: Simplifies protocol logic—no need for framing headers or reassembly windows. Limits maximum message size but aligns with typical agent coordination messages (control signals, not bulk data).
+We ensure that both Unix sockets and Raw IP preserve message boundaries. We never fragment or reassemble at the library level. This simplifies protocol logic by eliminating the need for framing headers or reassembly windows. It limits maximum message size but aligns with typical agent coordination messages (control signals, not bulk data).
 
 ## Technology Choices
 
+Table: Technology Stack
+
 | Component | Technology | Rationale |
-|-----------|-----------|-----------|
-| **Language** | Pure Go | Native goroutines, channels, context support. No C bindings = simpler deployment. |
-| **I/O** | Unix sockets (`unixgram`) | Datagram semantics, message boundaries, local IPC performance. |
-| **Networking** | Raw IP (IPPROTO_RAW or IPPROTO_UDP) | Minimal overhead, direct routing, no TCP state machine. |
-| **Concurrency** | Goroutines + Channels | Go-native, lightweight, natural message passing. |
-| **Synchronization** | sync.Mutex, sync.RWMutex | Standard library, well-understood, sufficient for peer registries and pools. |
-| **Testing** | Go's `testing` package | Concurrent goroutines testable via race detector and `context` package. |
-| **Context & Cancellation** | context.Context | Idiomatic Go for timeouts, cancellation, deadlines. |
+|-----------|------------|-----------|
+| Language | Pure Go | Native goroutines, channels, context support; no C bindings simplifies deployment |
+| I/O | Unix sockets (unixgram) | Datagram semantics, message boundaries, local IPC performance |
+| Networking | Raw IP (IPPROTO_RAW or IPPROTO_UDP) | Minimal overhead, direct routing, no TCP state machine |
+| Concurrency | Goroutines and Channels | Go-native, lightweight, natural message passing |
+| Synchronization | sync.Mutex, sync.RWMutex | Standard library, well-understood, sufficient for registries and pools |
+| Testing | Go testing package | Concurrent goroutines testable via race detector and context package |
+| Cancellation | context.Context | Idiomatic Go for timeouts, cancellation, deadlines |
 
 ## Project Structure
 
@@ -222,8 +341,15 @@ package "Transport Layer" {
 sp/
 ├── README.md                    # Project overview
 ├── doc/
-│   ├── VISION.md               # This file (strategic intent)
-│   ├── ARCHITECTURE.md         # This file (system design)
+│   ├── VISION.md               # Project goals and non-goals
+│   ├── ARCHITECTURE.md         # System design (this file)
+│   ├── prd/                    # Product Requirements Documents
+│   │   ├── req-rep-protocol.md # REQ/REP pattern specification
+│   │   ├── pub-sub-protocol.md # PUB/SUB pattern specification
+│   │   ├── pipeline-protocol.md # PIPELINE pattern specification
+│   │   ├── survey-protocol.md  # SURVEY pattern specification
+│   │   ├── bus-protocol.md     # BUS pattern specification
+│   │   └── pair-protocol.md    # PAIR pattern specification
 │   └── BACKGROUND/
 │       └── nng/                # Scalability Protocol reference docs
 │
@@ -247,7 +373,7 @@ sp/
 │   ├── io/                     # I/O workers
 │   │   ├── receiver.go         # Recv worker implementation
 │   │   ├── sender.go           # Send worker implementation
-│   │   └── worker.go           # Worker base/lifecycle
+│   │   └── worker.go           # Worker base and lifecycle
 │   │
 │   └── pool/                   # Shared infrastructure
 │       ├── buffer.go           # Message buffer pool
@@ -260,33 +386,17 @@ sp/
 └── test/
     ├── transport_test.go       # Transport layer tests
     ├── protocol_test.go        # Protocol engine tests
-    ├── integration_test.go      # End-to-end tests
+    ├── integration_test.go     # End-to-end tests
     └── bench_test.go           # Performance benchmarks
 ```
 
-## What's Next
+## Implementation Phases
 
-### Phase 1: Foundation (Synchronous API)
-1. Implement transport abstraction (Unix + Raw IP backends)
-2. Implement REQ/REP pattern with blocking API
-3. Basic error handling and resource cleanup
-4. Unit tests for transport and protocol layer
-5. Integration test: local agent request/response
+Table: Implementation Roadmap
 
-### Phase 2: Additional Patterns
-1. Implement PUB/SUB pattern
-2. Implement PIPELINE pattern
-3. Implement SURVEY, BUS, PAIR patterns
-4. Correctness testing across all patterns
-
-### Phase 3: Async API & Polish
-1. Channel-based Send/Recv wrapper
-2. Context integration (timeouts, cancellation)
-3. Performance benchmarks vs. TCP
-4. Stress testing (goroutine leaks, race detector)
-5. Documentation and examples
-
-### Phase 4: AEON Integration
-1. Integration with AEON agent coordinator
-2. Load testing under real agent workloads
-3. Performance tuning based on observed patterns
+| Phase | Focus | Deliverables |
+|-------|-------|--------------|
+| Phase 1 | Foundation (Synchronous API) | Transport abstraction, REQ/REP pattern, error handling, unit tests, integration test |
+| Phase 2 | Additional Patterns | PUB/SUB, PIPELINE, SURVEY, BUS, PAIR patterns with correctness testing |
+| Phase 3 | Async API and Polish | Channel-based Send/Recv, context integration, benchmarks, stress testing, documentation |
+| Phase 4 | AEON Integration | Integration with AEON agent coordinator, load testing, performance tuning |
