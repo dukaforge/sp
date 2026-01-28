@@ -1,17 +1,55 @@
 # PRD: Socket API and Blocking Interface
 
-**Issue**: sp-ms6.4
-**Status**: Draft
-**Author**: Claude
-**Date**: 2026-01-27
+Issue: sp-ms6.4
+Status: Draft
+Author: Claude
+Date: 2026-01-27
 
 ## Overview
 
-The Socket API provides the public interface for SP applications. It presents a traditional blocking Send()/Recv() API while internally coordinating protocol engines, I/O workers, and transports. This layer handles socket lifecycle (open, dial, listen, close) and error propagation from lower layers.
+The Socket API provides the public interface for SP applications. We present a traditional blocking Send()/Recv() API while internally coordinating protocol engines, I/O workers, and transports. This layer handles socket lifecycle (open, dial, listen, close) and error propagation from lower layers.
+
+```plantuml
+@startuml
+!theme plain
+title Socket API Architecture
+
+actor "Application" as App
+
+package "Public API" {
+  [Socket]
+  [Options]
+}
+
+package "Internal" {
+  [Protocol Engine]
+  [WorkerPair]
+  [PeerRegistry]
+  [ConnRegistry]
+  [BufferPool]
+}
+
+package "Transport" {
+  [Unix Transport]
+  [IP Transport]
+}
+
+App --> [Socket] : Send/Recv/Dial/Listen
+[Socket] --> [Protocol Engine]
+[Socket] --> [Options]
+[Protocol Engine] --> [WorkerPair]
+[WorkerPair] --> [Unix Transport]
+[WorkerPair] --> [IP Transport]
+[Socket] ..> [PeerRegistry]
+[Socket] ..> [ConnRegistry]
+[Socket] ..> [BufferPool]
+
+@enduml
+```
 
 ## Requirements
 
-### Functional Requirements
+Table: Functional Requirements
 
 | ID | Requirement |
 |----|-------------|
@@ -24,15 +62,15 @@ The Socket API provides the public interface for SP applications. It presents a 
 | SA-7 | Options configurable per-socket (timeouts, buffer sizes) |
 | SA-8 | Context support for cancellation and deadlines |
 
-### Non-Functional Requirements
+Table: Non-Functional Requirements
 
 | ID | Requirement |
 |----|-------------|
 | NF-1 | API surface minimal and intuitive |
 | NF-2 | Error messages descriptive and actionable |
 | NF-3 | No resource leaks on any code path |
-| NF-4 | Thread safety: all operations goroutine-safe |
-| NF-5 | Panic-free: no panics from user input |
+| NF-4 | All operations are goroutine-safe |
+| NF-5 | No panics from user input |
 
 ## Design
 
@@ -148,27 +186,7 @@ func (s *Socket) RecvMsg() (*Message, error)
 // Dial connects to a remote endpoint.
 // The address format depends on transport: "unix:///path" or "ip://host:port".
 // Non-blocking: returns immediately, connection happens in background.
-func (s *Socket) Dial(addr string) error {
-    if s.closed.Load() {
-        return ErrClosed
-    }
-
-    parsed, err := ParseAddr(addr)
-    if err != nil {
-        return fmt.Errorf("dial: %w", err)
-    }
-
-    dialer, err := s.createDialer(parsed)
-    if err != nil {
-        return fmt.Errorf("dial: %w", err)
-    }
-
-    s.dialers = append(s.dialers, dialer)
-    s.wg.Add(1)
-    go s.dialLoop(dialer)
-
-    return nil
-}
+func (s *Socket) Dial(addr string) error
 
 // DialAndWait connects to a remote endpoint and waits for connection.
 // Blocks until connected or error.
@@ -176,85 +194,38 @@ func (s *Socket) DialAndWait(addr string) error
 
 // Listen binds to a local address and accepts connections.
 // The address format depends on transport: "unix:///path" or "ip://host:port".
-func (s *Socket) Listen(addr string) error {
-    if s.closed.Load() {
-        return ErrClosed
-    }
-    if s.listener != nil {
-        return ErrAlreadyListening
-    }
-
-    parsed, err := ParseAddr(addr)
-    if err != nil {
-        return fmt.Errorf("listen: %w", err)
-    }
-
-    listener, err := s.createListener(parsed)
-    if err != nil {
-        return fmt.Errorf("listen: %w", err)
-    }
-
-    s.listener = listener
-    s.wg.Add(1)
-    go s.acceptLoop()
-
-    return nil
-}
-
-// dialLoop handles connection and reconnection for a dialer.
-func (s *Socket) dialLoop(d *Dialer) {
-    defer s.wg.Done()
-
-    for {
-        select {
-        case <-s.ctx.Done():
-            return
-        default:
-        }
-
-        t, err := d.Dial()
-        if err != nil {
-            // Backoff and retry
-            select {
-            case <-time.After(d.retryInterval):
-                continue
-            case <-s.ctx.Done():
-                return
-            }
-        }
-
-        // Register connection
-        entry, err := s.conns.Register(t, s)
-        if err != nil {
-            t.Close()
-            continue
-        }
-
-        // Wait for connection to close
-        <-entry.Done()
-    }
-}
-
-// acceptLoop handles incoming connections.
-func (s *Socket) acceptLoop() {
-    defer s.wg.Done()
-
-    for {
-        t, err := s.listener.Accept()
-        if err != nil {
-            if s.closed.Load() {
-                return
-            }
-            continue
-        }
-
-        // Register connection
-        s.conns.Register(t, s)
-    }
-}
+func (s *Socket) Listen(addr string) error
 ```
 
 ### Socket Lifecycle
+
+```plantuml
+@startuml
+!theme plain
+title Socket Lifecycle States
+
+[*] --> Created : NewXxxSocket()
+
+Created --> Open : automatic
+
+Open --> Connected : Dial() or Listen()
+Open --> Open : configure options
+
+Connected --> Connected : Send/Recv
+Connected --> Connected : reconnect on failure
+
+Connected --> Closed : Close()
+Open --> Closed : Close()
+
+Closed --> [*]
+
+note right of Connected
+  One or more peers
+  Messages flowing
+end note
+
+@enduml
+```
 
 ```go
 // Close shuts down the socket.
@@ -293,30 +264,6 @@ func (s *Socket) Close() error {
 func (s *Socket) IsClosed() bool {
     return s.closed.Load()
 }
-```
-
-### Lifecycle State Machine
-
-```
-            ┌──────────┐
-            │ Created  │
-            └────┬─────┘
-                 │ (automatic on New*)
-                 ▼
-            ┌──────────┐
-            │   Open   │◄───────────────┐
-            └────┬─────┘                │
-                 │ Dial() / Listen()    │
-                 ▼                      │
-        ┌────────────────┐              │
-        │   Connected    │──────────────┘
-        │  (one or more) │  (reconnect)
-        └───────┬────────┘
-                │ Close()
-                ▼
-            ┌──────────┐
-            │  Closed  │
-            └──────────┘
 ```
 
 ### Options Pattern
@@ -380,51 +327,10 @@ func WithMaxMessageSize(size int) Option {
 
 ```go
 // SendContext sends with context for cancellation/deadline.
-func (s *Socket) SendContext(ctx context.Context, data []byte) error {
-    if s.closed.Load() {
-        return ErrClosed
-    }
-
-    done := make(chan error, 1)
-    go func() {
-        done <- s.proto.Send(data)
-    }()
-
-    select {
-    case err := <-done:
-        return err
-    case <-ctx.Done():
-        return ctx.Err()
-    case <-s.ctx.Done():
-        return ErrClosed
-    }
-}
+func (s *Socket) SendContext(ctx context.Context, data []byte) error
 
 // RecvContext receives with context for cancellation/deadline.
-func (s *Socket) RecvContext(ctx context.Context) ([]byte, error) {
-    if s.closed.Load() {
-        return nil, ErrClosed
-    }
-
-    type result struct {
-        data []byte
-        err  error
-    }
-    done := make(chan result, 1)
-    go func() {
-        data, err := s.proto.Recv()
-        done <- result{data, err}
-    }()
-
-    select {
-    case r := <-done:
-        return r.data, r.err
-    case <-ctx.Done():
-        return nil, ctx.Err()
-    case <-s.ctx.Done():
-        return nil, ErrClosed
-    }
-}
+func (s *Socket) RecvContext(ctx context.Context) ([]byte, error)
 ```
 
 ### Error Types
@@ -466,32 +372,19 @@ func (e *SocketError) Unwrap() error { return e.Err }
 
 ### Address Parsing
 
+We support two address formats:
+
+Table: Address Formats
+
+| Transport | Format | Example |
+|-----------|--------|---------|
+| Unix | unix:///path/to/socket | unix:///tmp/sp.sock |
+| IP | ip://host:port | ip://127.0.0.1:5555 |
+| IP (IPv6) | ip://[ipv6]:port | ip://[::1]:5555 |
+
 ```go
 // ParseAddr parses an address string into a transport Addr.
-// Supported formats:
-//   - unix:///path/to/socket
-//   - ip://host:port
-//   - ip://[ipv6]:port
-func ParseAddr(s string) (Addr, error) {
-    u, err := url.Parse(s)
-    if err != nil {
-        return nil, ErrInvalidAddress
-    }
-
-    switch u.Scheme {
-    case "unix":
-        return &UnixAddr{Path: u.Path}, nil
-    case "ip":
-        host, port, err := net.SplitHostPort(u.Host)
-        if err != nil {
-            return nil, ErrInvalidAddress
-        }
-        p, _ := strconv.Atoi(port)
-        return &IPAddr{Host: host, Port: p}, nil
-    default:
-        return nil, fmt.Errorf("%w: unknown scheme %q", ErrInvalidAddress, u.Scheme)
-    }
-}
+func ParseAddr(s string) (Addr, error)
 ```
 
 ### Usage Example
@@ -547,58 +440,57 @@ fmt.Printf("Reply: %s\n", reply)
 
 ## Testing Strategy
 
-### Unit Tests
+Table: Unit Tests
 
 | Test | Description |
 |------|-------------|
-| `TestSocketCreate` | Factory functions create correct socket types |
-| `TestSocketOptions` | Options pattern configures sockets correctly |
-| `TestSocketClose` | Close releases resources and cancels ops |
-| `TestSocketCloseIdempotent` | Multiple Close() calls safe |
-| `TestSocketDialInvalidAddr` | Invalid address returns error |
-| `TestSocketListenAlreadyListening` | Double listen returns error |
-| `TestParseAddr` | Address parsing for all formats |
-| `TestSocketContextCancel` | Context cancellation works |
+| TestSocketCreate | Factory functions create correct socket types |
+| TestSocketOptions | Options pattern configures sockets correctly |
+| TestSocketClose | Close releases resources and cancels ops |
+| TestSocketCloseIdempotent | Multiple Close() calls safe |
+| TestSocketDialInvalidAddr | Invalid address returns error |
+| TestSocketListenAlreadyListening | Double listen returns error |
+| TestParseAddr | Address parsing for all formats |
+| TestSocketContextCancel | Context cancellation works |
 
-### Integration Tests
+Table: Integration Tests
 
 | Test | Description |
 |------|-------------|
-| `TestSocketReqRep` | Full REQ/REP exchange |
-| `TestSocketReconnect` | Automatic reconnection on disconnect |
-| `TestSocketMultipleClients` | Multiple clients to one server |
-| `TestSocketUnixTransport` | Socket API with Unix transport |
-| `TestSocketIPTransport` | Socket API with IP transport |
+| TestSocketReqRep | Full REQ/REP exchange |
+| TestSocketReconnect | Automatic reconnection on disconnect |
+| TestSocketMultipleClients | Multiple clients to one server |
+| TestSocketUnixTransport | Socket API with Unix transport |
+| TestSocketIPTransport | Socket API with IP transport |
 
-### Benchmarks
+Table: Benchmarks
 
 | Benchmark | Target |
 |-----------|--------|
-| `BenchmarkSocketSendRecv` | < 25μs round-trip |
-| `BenchmarkSocketCreate` | < 1ms socket creation |
-| `BenchmarkSocketClose` | < 10ms socket close |
+| BenchmarkSocketSendRecv | < 25μs round-trip |
+| BenchmarkSocketCreate | < 1ms socket creation |
+| BenchmarkSocketClose | < 10ms socket close |
 
 ## Acceptance Criteria
 
-1. **Factory Functions Work**: Create all socket types
-2. **Send/Recv Work**: Blocking operations complete correctly
-3. **Dial/Listen Work**: Connection management functional
-4. **Close Works**: Clean shutdown with no leaks
-5. **Options Work**: Configuration via options pattern
-6. **Context Works**: Cancellation via context
-7. **Errors Clear**: Descriptive, actionable error messages
-8. **Thread Safe**: All operations goroutine-safe
-9. **Documentation**: GoDoc comments, usage examples
+We consider this PRD complete when:
+
+1. Factory functions create all socket types
+2. Send/Recv operations complete correctly
+3. Dial/Listen connection management is functional
+4. Close shuts down cleanly with no leaks
+5. Options pattern configures sockets
+6. Context cancellation works
+7. Error messages are descriptive and actionable
+8. All operations are goroutine-safe
+9. GoDoc comments and usage examples exist
 
 ## Dependencies
 
-- Transport Abstraction Layer (sp-ms6.1)
-- Shared Infrastructure (sp-ms6.7)
-- I/O Workers (sp-ms6.3)
-- REQ/REP Protocol Engine (sp-ms6.2)
+We depend on the Transport Abstraction Layer (sp-ms6.1), Shared Infrastructure (sp-ms6.7), I/O Workers (sp-ms6.3), and REQ/REP Protocol Engine (sp-ms6.2).
 
 ## References
 
-- SP ARCHITECTURE.md - Socket API Layer section
+- SP ARCHITECTURE.md, Socket API Layer section
 - [Go context package](https://pkg.go.dev/context)
 - [Go options pattern](https://dave.cheney.net/2014/10/17/functional-options-for-friendly-apis)

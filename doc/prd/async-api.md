@@ -1,17 +1,45 @@
 # PRD: Go-Native Async API (Phase 2)
 
-**Issue**: sp-ms6.6
-**Status**: Draft
-**Author**: Claude
-**Date**: 2026-01-27
+Issue: sp-ms6.6
+Status: Draft
+Author: Claude
+Date: 2026-01-27
 
 ## Overview
 
-The Async API provides channel-based interfaces for non-blocking message operations in Go. It complements the blocking Send/Recv API with Go-native patterns using channels and contexts. Applications can select between sync and async styles or mix them based on their needs.
+The Async API provides channel-based interfaces for non-blocking message operations in Go. We complement the blocking Send/Recv API with Go-native patterns using channels and contexts. Applications can select between sync and async styles or mix them based on their needs.
+
+```plantuml
+@startuml
+!theme plain
+title Async API Architecture
+
+actor "Application" as App
+
+package "Socket" {
+  [Blocking API] as Sync
+  [Channel API] as Async
+  [Protocol Engine] as Proto
+}
+
+App --> Sync : Send()/Recv()
+App --> Async : SendChan()/RecvChan()
+
+Sync --> Proto
+Async --> Proto
+
+note right of Async
+  Go channels
+  Select compatible
+  Context integration
+end note
+
+@enduml
+```
 
 ## Requirements
 
-### Functional Requirements
+Table: Functional Requirements
 
 | ID | Requirement |
 |----|-------------|
@@ -22,20 +50,20 @@ The Async API provides channel-based interfaces for non-blocking message operati
 | AA-5 | Both sync and async APIs usable on same socket |
 | AA-6 | Channel close signals socket shutdown |
 
-### Non-Functional Requirements
+Table: Non-Functional Requirements
 
 | ID | Requirement |
 |----|-------------|
-| NF-1 | Async API adds < 1μs overhead vs sync |
+| NF-1 | Async API adds under 1μs overhead vs sync |
 | NF-2 | No goroutine leaks from async operations |
 | NF-3 | Channel operations are non-blocking when buffer available |
-| NF-4 | Memory-safe: no races, no panics |
+| NF-4 | Memory-safe (no races, no panics) |
 
 ## Design
 
 ### Channel Interface
 
-Each socket exposes typed channels for async operations:
+We expose typed channels for async operations on each socket:
 
 ```go
 // Socket extended with async interface
@@ -63,6 +91,8 @@ func (s *Socket) RecvChan() <-chan []byte
 
 ### Channel Creation and Lifecycle
 
+We create channels lazily on first access:
+
 ```go
 func (s *Socket) SendChan() chan<- []byte {
     s.asyncMu.Lock()
@@ -87,69 +117,11 @@ func (s *Socket) RecvChan() <-chan []byte {
     }
     return s.recvChan
 }
-
-// sendPump forwards from sendChan to protocol
-func (s *Socket) sendPump() {
-    defer s.wg.Done()
-    defer close(s.sendChan)
-
-    for {
-        select {
-        case data, ok := <-s.sendChan:
-            if !ok {
-                return
-            }
-            s.proto.Send(data)
-        case <-s.ctx.Done():
-            return
-        }
-    }
-}
-
-// recvPump forwards from protocol to recvChan
-func (s *Socket) recvPump() {
-    defer s.wg.Done()
-    defer close(s.recvChan)
-
-    for {
-        data, err := s.proto.Recv()
-        if err != nil {
-            return
-        }
-
-        select {
-        case s.recvChan <- data:
-            // Delivered
-        case <-s.ctx.Done():
-            return
-        }
-    }
-}
-```
-
-### Message Type for Async Operations
-
-For operations requiring metadata (address, headers), use a typed message:
-
-```go
-// AsyncMessage carries message data with metadata.
-type AsyncMessage struct {
-    Data   []byte
-    Addr   Addr   // Source (recv) or destination (send)
-    Header []byte // Protocol-specific header
-    Err    error  // Non-nil if operation failed
-}
-
-// SendMsgChan returns a channel for sending messages with metadata.
-func (s *Socket) SendMsgChan() chan<- *AsyncMessage
-
-// RecvMsgChan returns a channel for receiving messages with metadata.
-func (s *Socket) RecvMsgChan() <-chan *AsyncMessage
 ```
 
 ### Context Integration
 
-Context provides cancellation and deadlines:
+We provide context-aware methods for cancellation and deadlines:
 
 ```go
 // SendCtx sends with context-based cancellation.
@@ -204,12 +176,7 @@ func handleMultiple(sockets []*Socket) {
     }
 
     chosen, value, ok := reflect.Select(cases)
-    if chosen == len(sockets) {
-        // Timeout
-    } else if ok {
-        data := value.Interface().([]byte)
-        // Handle message from sockets[chosen]
-    }
+    // Handle result based on chosen index
 }
 
 // Simple select usage
@@ -240,7 +207,7 @@ func fanIn(sources ...*Socket) <-chan []byte {
 
 ### Sync/Async Relationship
 
-Both APIs work on the same socket:
+Both APIs work on the same socket. We note that messages go to either sync or async consumer, not both. Order is preserved within each receive path. Closing the socket closes all channels.
 
 ```go
 // Sync and async can be mixed
@@ -259,11 +226,6 @@ func mixedUsage(s *Socket) {
     s.SendChan() <- []byte("world")
 }
 ```
-
-**Important notes**:
-1. Messages go to either sync or async consumer, not both
-2. Order is preserved within each receive path
-3. Closing socket closes all channels
 
 ### Configuration
 
@@ -290,12 +252,14 @@ const (
 
 ### Pattern-Specific Considerations
 
+Table: Channel Availability by Pattern
+
 | Pattern | Send Channel | Recv Channel | Notes |
 |---------|--------------|--------------|-------|
 | REQ | Yes | Yes | Send triggers recv expectation |
 | REP | Yes | Yes | Recv must precede send |
-| PUB | Yes | No | Publishers don't receive |
-| SUB | No | Yes | Subscribers don't send |
+| PUB | Yes | No | Publishers do not receive |
+| SUB | No | Yes | Subscribers do not send |
 | PUSH | Yes | No | One-way send |
 | PULL | No | Yes | One-way receive |
 | SURVEYOR | Yes | Yes | Recv collects responses |
@@ -320,13 +284,7 @@ if err != nil {
     }
 }
 
-// Option 2: Use message channel with error field
-msg := <-s.RecvMsgChan()
-if msg.Err != nil {
-    // Handle error
-}
-
-// Option 3: Channel close indicates shutdown
+// Option 2: Channel close indicates shutdown
 data, ok := <-s.RecvChan()
 if !ok {
     // Socket closed
@@ -335,7 +293,7 @@ if !ok {
 
 ### Migration Guide
 
-**From sync to async**:
+We provide guidance for transitioning from sync to async:
 
 ```go
 // Sync (blocking)
@@ -355,66 +313,56 @@ defer cancel()
 data, err := s.RecvCtx(ctx)
 ```
 
-**From callback-based APIs**:
-
-```go
-// Instead of callbacks, use channels
-go func() {
-    for data := range s.RecvChan() {
-        handleMessage(data)  // Your "callback"
-    }
-}()
-```
-
 ## Testing Strategy
 
-### Unit Tests
+Table: Unit Tests
 
 | Test | Description |
 |------|-------------|
-| `TestSendChanBasic` | Send via channel works |
-| `TestRecvChanBasic` | Recv via channel works |
-| `TestSendCtxCancel` | Context cancellation stops send |
-| `TestRecvCtxTimeout` | Context timeout works |
-| `TestChannelClose` | Socket close closes channels |
-| `TestMixedSyncAsync` | Both APIs work together |
+| TestSendChanBasic | Send via channel works |
+| TestRecvChanBasic | Recv via channel works |
+| TestSendCtxCancel | Context cancellation stops send |
+| TestRecvCtxTimeout | Context timeout works |
+| TestChannelClose | Socket close closes channels |
+| TestMixedSyncAsync | Both APIs work together |
 
-### Integration Tests
+Table: Integration Tests
 
 | Test | Description |
 |------|-------------|
-| `TestAsyncReqRep` | Full exchange using channels |
-| `TestAsyncFanIn` | Multiple sources to one consumer |
-| `TestAsyncSelect` | Select across multiple sockets |
-| `TestAsyncPubSub` | Pub/Sub with channel interface |
+| TestAsyncReqRep | Full exchange using channels |
+| TestAsyncFanIn | Multiple sources to one consumer |
+| TestAsyncSelect | Select across multiple sockets |
+| TestAsyncPubSub | Pub/Sub with channel interface |
 
-### Benchmarks
+Table: Benchmarks
 
 | Benchmark | Target |
 |-----------|--------|
-| `BenchmarkAsyncSend` | < 100ns channel send |
-| `BenchmarkAsyncRecv` | < 100ns channel recv |
-| `BenchmarkAsyncVsSync` | < 1μs overhead |
-| `BenchmarkAsyncSelect` | Efficient multi-socket select |
+| BenchmarkAsyncSend | < 100ns channel send |
+| BenchmarkAsyncRecv | < 100ns channel recv |
+| BenchmarkAsyncVsSync | < 1μs overhead |
+| BenchmarkAsyncSelect | Efficient multi-socket select |
 
 ## Acceptance Criteria
 
-1. **Send/Recv Channels Work**: Basic async operations functional
-2. **Context Integration**: Cancellation and timeouts work
-3. **Select Compatible**: Works with Go's select
-4. **Mixed Mode**: Sync and async usable together
-5. **Clean Shutdown**: Channels close properly, no leaks
-6. **Documentation**: GoDoc, examples, migration guide
-7. **Benchmarks Pass**: Overhead < 1μs vs sync
+We consider this PRD complete when:
+
+1. Send/Recv channels work for basic async operations
+2. Context integration enables cancellation and timeouts
+3. Channels work with Go's select
+4. Sync and async APIs are usable together
+5. Shutdown closes channels cleanly with no leaks
+6. GoDoc, examples, and migration guide exist
+7. Benchmarks show overhead under 1μs vs sync
 
 ## Dependencies
 
-- Socket API (sp-ms6.4) - Base socket interface
-- All protocol implementations - Pattern-specific behavior
+We depend on Socket API (sp-ms6.4) and all protocol implementations for pattern-specific behavior.
 
 ## References
 
 - [Go Channels](https://go.dev/doc/effective_go#channels)
 - [Go Context](https://pkg.go.dev/context)
 - [Go Select](https://go.dev/tour/concurrency/5)
-- SP ARCHITECTURE.md - Phase 3: Async API section
+- SP ARCHITECTURE.md, Phase 3: Async API section

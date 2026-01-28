@@ -1,44 +1,86 @@
 # PRD: Transport Abstraction Layer
 
-**Issue**: sp-ms6.1
-**Status**: Draft
-**Author**: Claude
-**Date**: 2026-01-27
+Issue: sp-ms6.1
+Status: Draft
+Author: Claude
+Date: 2026-01-27
 
 ## Overview
 
-The Transport Abstraction Layer provides a unified interface for message-oriented communication across different underlying transports. SP supports two transports:
+The Transport Abstraction Layer provides a unified interface for message-oriented communication across different underlying transports. We support two transports: Unix Domain Sockets for local IPC with datagram semantics, and Raw IP Sockets for network communication without TCP overhead.
 
-1. **Unix Domain Sockets (unixgram)** - Local IPC with datagram semantics
-2. **Raw IP Sockets** - Network communication without TCP overhead
+```plantuml
+@startuml
+!theme plain
+title Transport Layer Architecture
 
-This PRD defines the transport interface, implementation requirements, and testing strategy.
+package "Socket API" {
+  [Socket]
+}
+
+package "Transport Abstraction" {
+  interface "Transport" as T
+  interface "Listener" as L
+  interface "Dialer" as D
+  interface "Addr" as A
+}
+
+package "Implementations" {
+  [UnixTransport]
+  [IPTransport]
+  [UnixListener]
+  [IPListener]
+}
+
+package "Operating System" {
+  [Unix Domain Socket\n(unixgram)]
+  [UDP Socket]
+}
+
+[Socket] --> T
+[Socket] --> L
+[Socket] --> D
+
+[UnixTransport] ..|> T
+[IPTransport] ..|> T
+[UnixListener] ..|> L
+[IPListener] ..|> L
+
+[UnixTransport] --> [Unix Domain Socket\n(unixgram)]
+[IPTransport] --> [UDP Socket]
+[UnixListener] --> [Unix Domain Socket\n(unixgram)]
+[IPListener] --> [UDP Socket]
+
+@enduml
+```
 
 ## Requirements
 
-### Functional Requirements
+Table: Functional Requirements
 
 | ID | Requirement |
 |----|-------------|
 | TR-1 | Transport interface abstracts dial, listen, send, and recv operations |
-| TR-2 | Both transports preserve message boundaries (no fragmentation/reassembly) |
-| TR-3 | Transport selection happens at socket creation time |
+| TR-2 | Both transports preserve message boundaries without fragmentation |
+| TR-3 | Transport selection occurs at socket creation time |
 | TR-4 | Transports expose consistent addressing schemes |
 | TR-5 | Close operations release system resources deterministically |
 | TR-6 | Transports report errors using consistent error types |
 
-### Non-Functional Requirements
+Table: Non-Functional Requirements
 
 | ID | Requirement |
 |----|-------------|
-| NF-1 | Unix socket latency: < 10μs for local message round-trip |
-| NF-2 | Memory allocation: zero-alloc steady-state for send/recv |
-| NF-3 | Thread safety: all transport operations are goroutine-safe |
-| NF-4 | Resource cleanup: no leaked file descriptors on Close() |
+| NF-1 | Unix socket latency below 10μs for local message round-trip |
+| NF-2 | Zero allocations in steady-state send/recv operations |
+| NF-3 | All transport operations are goroutine-safe |
+| NF-4 | No leaked file descriptors on Close() |
 
 ## Design
 
 ### Transport Interface
+
+We define four interfaces that all transport implementations must satisfy.
 
 ```go
 // Transport represents a message-oriented communication channel.
@@ -99,12 +141,16 @@ type Addr interface {
 
 ### Address Formats
 
+Table: Transport Address Formats
+
 | Transport | Format | Examples |
 |-----------|--------|----------|
 | Unix | `unix://<path>` | `unix:///tmp/sp.sock`, `unix:///var/run/agent.sock` |
 | Raw IP | `ip://<host>:<port>` | `ip://192.168.1.1:5555`, `ip://[::1]:5555` |
 
 ### Unix Domain Socket Implementation
+
+We implement Unix transport using datagram sockets (unixgram) to preserve message boundaries automatically.
 
 ```go
 // UnixTransport implements Transport over Unix datagram sockets.
@@ -124,14 +170,18 @@ type UnixListener struct {
 }
 ```
 
-**Key Design Decisions**:
+Table: Unix Transport Design Decisions
 
-1. **Datagram mode (`unixgram`)**: Preserves message boundaries automatically
-2. **Preallocated buffers**: `recvBuf` is sized to max message size (64KB default)
-3. **Abstract namespace support** (Linux): Addresses starting with `@` use abstract namespace
-4. **File cleanup**: Listener removes socket file on Close() (non-abstract only)
+| Decision | Rationale |
+|----------|-----------|
+| Datagram mode (unixgram) | Preserves message boundaries automatically |
+| Preallocated buffers | recvBuf sized to max message size (64KB default) eliminates per-recv allocation |
+| Abstract namespace support | Linux addresses starting with `@` use abstract namespace, avoiding file cleanup |
+| File cleanup on Close | Listener removes socket file for non-abstract addresses |
 
 ### Raw IP Socket Implementation
+
+We use UDP sockets rather than raw IP to gain message boundaries with simpler implementation.
 
 ```go
 // IPTransport implements Transport over raw IP sockets.
@@ -151,25 +201,31 @@ type IPListener struct {
 }
 ```
 
-**Key Design Decisions**:
+Table: IP Transport Design Decisions
 
-1. **UDP over raw IP**: Simpler, provides message boundaries, widely supported
-2. **No TCP**: Avoids connection state, head-of-line blocking, Nagle delays
-3. **IPv4 and IPv6**: Both supported via Go's `net.UDPConn`
-4. **Port reuse**: `SO_REUSEADDR` enabled for quick restart
+| Decision | Rationale |
+|----------|-----------|
+| UDP over raw IP | Simpler implementation, provides message boundaries, widely supported |
+| No TCP | Avoids connection state, head-of-line blocking, Nagle delays |
+| IPv4 and IPv6 support | Both supported via Go's net.UDPConn |
+| SO_REUSEADDR enabled | Allows quick restart after crash |
 
 ### Message Boundary Preservation
 
-Both transports guarantee message boundaries:
+Both transports guarantee message boundaries through datagram semantics.
+
+Table: Message Boundary Guarantees
 
 | Transport | Mechanism | Max Message Size |
 |-----------|-----------|------------------|
 | Unix (unixgram) | Datagram semantics | 64KB (configurable) |
 | Raw IP (UDP) | Datagram semantics | 65507 bytes (UDP limit) |
 
-**No framing required**: Unlike TCP streams, these transports deliver complete messages or fail. The library does not implement length-prefix framing.
+Unlike TCP streams, these transports deliver complete messages or fail. We do not implement length-prefix framing because the underlying transports handle message boundaries.
 
 ### Error Handling
+
+We map platform-specific errors (EAGAIN, ECONNREFUSED) to transport-level errors for consistent handling across platforms.
 
 ```go
 var (
@@ -190,17 +246,11 @@ var (
 )
 ```
 
-**Error mapping**: Platform-specific errors (EAGAIN, ECONNREFUSED, etc.) are mapped to these transport-level errors.
-
 ### Backpressure
 
-Transports implement backpressure via blocking:
+We implement backpressure through blocking. Send blocks when the kernel send buffer fills. Recv blocks when no messages are available. Deadlines prevent indefinite blocking.
 
-1. **Send blocks** when the kernel send buffer is full
-2. **Recv blocks** when no messages are available
-3. **Deadlines** prevent indefinite blocking
-
-The protocol layer uses these blocking semantics for natural flow control. No explicit backpressure signals are needed at the transport level.
+The protocol layer uses these blocking semantics for natural flow control without explicit backpressure signals.
 
 ### Configuration
 
@@ -227,50 +277,54 @@ type TransportConfig struct {
 
 ## Testing Strategy
 
-### Unit Tests
+Table: Unit Tests
 
 | Test | Description |
 |------|-------------|
-| `TestUnixSendRecv` | Basic send/receive on Unix socket |
-| `TestUnixMessageBoundary` | Multiple messages maintain boundaries |
-| `TestUnixConcurrent` | Concurrent send/recv from multiple goroutines |
-| `TestUnixClose` | Close releases resources, subsequent ops fail |
-| `TestUnixDeadline` | Deadline timeout returns ErrTimeout |
-| `TestIPSendRecv` | Basic send/receive on IP socket |
-| `TestIPMessageBoundary` | Multiple messages maintain boundaries |
-| `TestIPConcurrent` | Concurrent operations |
-| `TestIPClose` | Resource cleanup |
-| `TestIPDeadline` | Timeout handling |
+| TestUnixSendRecv | Basic send/receive on Unix socket |
+| TestUnixMessageBoundary | Multiple messages maintain boundaries |
+| TestUnixConcurrent | Concurrent send/recv from multiple goroutines |
+| TestUnixClose | Close releases resources, subsequent ops fail |
+| TestUnixDeadline | Deadline timeout returns ErrTimeout |
+| TestIPSendRecv | Basic send/receive on IP socket |
+| TestIPMessageBoundary | Multiple messages maintain boundaries |
+| TestIPConcurrent | Concurrent operations |
+| TestIPClose | Resource cleanup |
+| TestIPDeadline | Timeout handling |
 
-### Integration Tests
+Table: Integration Tests
 
 | Test | Description |
 |------|-------------|
-| `TestUnixClientServer` | Full client-server exchange via Unix |
-| `TestIPClientServer` | Full client-server exchange via IP |
-| `TestTransportSwitch` | Same protocol code works with both transports |
+| TestUnixClientServer | Full client-server exchange via Unix |
+| TestIPClientServer | Full client-server exchange via IP |
+| TestTransportSwitch | Same protocol code works with both transports |
 
-### Benchmarks
+Table: Benchmarks
 
 | Benchmark | Target |
 |-----------|--------|
-| `BenchmarkUnixLatency` | < 10μs round-trip |
-| `BenchmarkUnixThroughput` | > 100K msg/sec (1KB messages) |
-| `BenchmarkIPLatency` | < 100μs round-trip (localhost) |
-| `BenchmarkIPThroughput` | > 50K msg/sec (1KB messages) |
-| `BenchmarkZeroAlloc` | 0 allocs in steady-state send/recv |
+| BenchmarkUnixLatency | < 10μs round-trip |
+| BenchmarkUnixThroughput | > 100K msg/sec (1KB messages) |
+| BenchmarkIPLatency | < 100μs round-trip (localhost) |
+| BenchmarkIPThroughput | > 50K msg/sec (1KB messages) |
+| BenchmarkZeroAlloc | 0 allocs in steady-state send/recv |
 
 ## Acceptance Criteria
 
-1. **Interface Complete**: Transport, Listener, Dialer, Addr interfaces defined
-2. **Unix Implementation**: Full implementation passing all unit tests
-3. **IP Implementation**: Full implementation passing all unit tests
-4. **Error Handling**: All error conditions mapped to transport errors
-5. **Benchmarks Pass**: Meet latency and throughput targets
-6. **Zero-Alloc**: No allocations in steady-state operations
-7. **Documentation**: GoDoc comments on all exported types/methods
+We consider this PRD complete when:
+
+1. Transport, Listener, Dialer, and Addr interfaces are defined
+2. Unix implementation passes all unit tests
+3. IP implementation passes all unit tests
+4. All error conditions map to transport errors
+5. Benchmarks meet latency and throughput targets
+6. Steady-state operations allocate no memory
+7. GoDoc comments exist on all exported types and methods
 
 ## Open Questions
+
+Table: Open Questions
 
 | Question | Status | Resolution |
 |----------|--------|------------|
@@ -280,12 +334,11 @@ type TransportConfig struct {
 
 ## Dependencies
 
-- Go standard library: `net`, `syscall`
-- No external dependencies
+We depend only on the Go standard library: `net` and `syscall` packages. We have no external dependencies.
 
 ## References
 
 - [Go net package](https://pkg.go.dev/net)
 - [Unix domain sockets](https://man7.org/linux/man-pages/man7/unix.7.html)
 - [UDP sockets](https://man7.org/linux/man-pages/man7/udp.7.html)
-- SP ARCHITECTURE.md - Transport Layer section
+- SP ARCHITECTURE.md, Transport Layer section

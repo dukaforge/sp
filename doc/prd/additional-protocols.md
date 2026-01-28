@@ -1,25 +1,27 @@
 # PRD: Additional Protocol Patterns (Phase 2)
 
-**Issue**: sp-ms6.8
-**Status**: Draft
-**Author**: Claude
-**Date**: 2026-01-27
+Issue: sp-ms6.8
+Status: Draft
+Author: Claude
+Date: 2026-01-27
 
 ## Overview
 
-This document specifies the remaining Scalability Protocol patterns beyond REQ/REP: PUB/SUB for broadcast messaging, PIPELINE for work distribution, SURVEY for request-response fanout, BUS for peer-to-peer communication, and PAIR for bidirectional channels. These patterns build on the foundation established by the REQ/REP implementation.
+We specify the remaining Scalability Protocol patterns beyond REQ/REP: PUB/SUB for broadcast messaging, PIPELINE for work distribution, SURVEY for request-response fanout, BUS for peer-to-peer communication, and PAIR for bidirectional channels. These patterns build on the foundation established by the REQ/REP implementation.
 
 ## Common Design Elements
 
 All protocols share these elements from the REQ/REP foundation:
 
-- **State Machine Pattern**: Each socket type has a well-defined state machine
-- **Protocol Goroutine**: Dedicated goroutine(s) manage protocol logic
-- **I/O Worker Integration**: SendCh/RecvCh channels connect to WorkerPair
-- **Shared Infrastructure**: BufferPool, PeerRegistry, ConnRegistry
-- **Error Types**: Consistent error handling (ErrClosed, ErrTimeout, etc.)
+Table: Shared Components
 
----
+| Component | Usage |
+|-----------|-------|
+| State Machine Pattern | Each socket type has well-defined states |
+| Protocol Goroutine | Dedicated goroutine(s) manage protocol logic |
+| I/O Worker Integration | SendCh/RecvCh channels connect to WorkerPair |
+| Shared Infrastructure | BufferPool, PeerRegistry, ConnRegistry |
+| Error Types | Consistent error handling (ErrClosed, ErrTimeout) |
 
 ## PUB/SUB Pattern
 
@@ -27,7 +29,39 @@ All protocols share these elements from the REQ/REP foundation:
 
 PUB/SUB provides one-to-many message distribution. A PUB (publisher) socket broadcasts messages to all connected SUB (subscriber) sockets. Subscribers can filter messages by topic prefix.
 
-### Requirements
+```plantuml
+@startuml
+!theme plain
+title PUB/SUB Message Flow
+
+participant "Publisher" as PUB
+participant "Subscriber A" as SUBA
+participant "Subscriber B" as SUBB
+participant "Subscriber C" as SUBC
+
+PUB -> SUBA : topic:weather data
+PUB -> SUBB : topic:weather data
+PUB -> SUBC : topic:weather data
+
+note over SUBA
+  Subscribed to "weather"
+  Receives message
+end note
+
+note over SUBB
+  Subscribed to "sports"
+  Filters message
+end note
+
+note over SUBC
+  Subscribed to ""
+  Receives all
+end note
+
+@enduml
+```
+
+Table: PUB/SUB Requirements
 
 | ID | Requirement |
 |----|-------------|
@@ -36,140 +70,79 @@ PUB/SUB provides one-to-many message distribution. A PUB (publisher) socket broa
 | PS-3 | Topic matching uses prefix-based filtering |
 | PS-4 | Subscribers can subscribe/unsubscribe to multiple topics |
 | PS-5 | Empty subscription matches all messages |
-| PS-6 | No reply expected - fire and forget semantics |
-
-### State Machines
-
-**PUB Socket**: Stateless (always ready to send)
-```
-┌──────┐
-│ OPEN │──► Send() broadcasts to all peers
-└──────┘
-```
-
-**SUB Socket**: Stateless (always ready to receive)
-```
-┌──────┐
-│ OPEN │──► Recv() returns matching messages
-└──────┘
-```
+| PS-6 | No reply expected (fire and forget semantics) |
 
 ### Design
+
+We implement PUB as a stateless broadcaster and SUB with topic filtering:
 
 ```go
 // PubSocket broadcasts messages to all subscribers.
 type PubSocket struct {
     base   *BaseSocket
     peers  *PeerRegistry
-
-    sendCh chan<- *Message  // Broadcast to all peers
+    sendCh chan<- *Message
 }
 
 // Send broadcasts a message to all connected subscribers.
-// Non-blocking if buffers available; blocks if all peer buffers full.
 func (s *PubSocket) Send(data []byte) error
 
 // SubSocket receives messages from publishers.
 type SubSocket struct {
     base    *BaseSocket
-
-    // Subscription management
     subsMu  sync.RWMutex
     subs    map[string]struct{}  // Topic prefixes
-
     recvCh  <-chan *Message
-    filteredCh chan *Message  // After topic filtering
 }
 
 // Subscribe adds a topic prefix subscription.
-// Messages with this prefix will be received.
 func (s *SubSocket) Subscribe(topic string) error
 
 // Unsubscribe removes a topic subscription.
 func (s *SubSocket) Unsubscribe(topic string) error
 
 // Recv receives the next message matching subscriptions.
-// Blocks until a matching message arrives.
 func (s *SubSocket) Recv() ([]byte, error)
 ```
-
-### Topic Filtering
-
-```go
-func (s *SubSocket) matchesTopic(msg []byte) bool {
-    s.subsMu.RLock()
-    defer s.subsMu.RUnlock()
-
-    // Empty subscription matches everything
-    if len(s.subs) == 0 {
-        return true
-    }
-
-    for topic := range s.subs {
-        if bytes.HasPrefix(msg, []byte(topic)) {
-            return true
-        }
-    }
-    return false
-}
-```
-
-### Fan-Out Strategy
-
-PUB sends to all connected peers:
-```go
-func (s *PubSocket) broadcast(msg *Message) {
-    peers := s.peers.All()
-    for _, peer := range peers {
-        // Clone message for each peer
-        peerMsg := msg.Clone()
-        peerMsg.PeerID = peer.ID
-
-        select {
-        case peer.SendCh <- peerMsg:
-            // Sent
-        default:
-            // Peer buffer full, drop message for this peer
-            peerMsg.Release()
-        }
-    }
-    msg.Release()
-}
-```
-
----
 
 ## PIPELINE Pattern
 
 ### Overview
 
-PIPELINE distributes work among multiple workers. PUSH sockets send tasks, PULL sockets receive them. Tasks are load-balanced across available workers.
+PIPELINE distributes work among multiple workers. PUSH sockets send tasks, PULL sockets receive them. We load-balance tasks across available workers.
 
-### Requirements
+```plantuml
+@startuml
+!theme plain
+title PIPELINE Work Distribution
+
+participant "Producer" as PUSH
+participant "Worker A" as PULLA
+participant "Worker B" as PULLB
+participant "Worker C" as PULLC
+
+PUSH -> PULLA : task 1
+PUSH -> PULLB : task 2
+PUSH -> PULLC : task 3
+PUSH -> PULLA : task 4
+
+note over PUSH
+  Round-robin
+  distribution
+end note
+
+@enduml
+```
+
+Table: PIPELINE Requirements
 
 | ID | Requirement |
 |----|-------------|
 | PL-1 | PUSH socket sends messages to one connected PULL socket |
 | PL-2 | PULL socket receives messages from connected PUSH sockets |
 | PL-3 | Messages are load-balanced across PULL sockets (round-robin) |
-| PL-4 | No reply expected - one-way data flow |
+| PL-4 | No reply expected (one-way data flow) |
 | PL-5 | Backpressure when all workers busy |
-
-### State Machines
-
-**PUSH Socket**: Stateless (always ready to send)
-```
-┌──────┐
-│ OPEN │──► Send() delivers to one worker
-└──────┘
-```
-
-**PULL Socket**: Stateless (always ready to receive)
-```
-┌──────┐
-│ OPEN │──► Recv() returns next task
-└──────┘
-```
 
 ### Design
 
@@ -182,7 +155,6 @@ type PushSocket struct {
 }
 
 // Send sends a task to one worker (round-robin selection).
-// Blocks if all worker buffers are full.
 func (s *PushSocket) Send(data []byte) error
 
 // PullSocket receives tasks from producers.
@@ -192,26 +164,8 @@ type PullSocket struct {
 }
 
 // Recv receives the next task.
-// Blocks until a task is available.
 func (s *PullSocket) Recv() ([]byte, error)
 ```
-
-### Load Balancing
-
-```go
-func (s *PushSocket) selectWorker() (*Peer, error) {
-    peers := s.peers.All()
-    if len(peers) == 0 {
-        return nil, ErrNoPeers
-    }
-
-    // Round-robin with wraparound
-    idx := s.peerIdx.Add(1) % uint32(len(peers))
-    return peers[idx], nil
-}
-```
-
----
 
 ## SURVEY Pattern
 
@@ -219,7 +173,32 @@ func (s *PushSocket) selectWorker() (*Peer, error) {
 
 SURVEY implements request-response fanout. A SURVEYOR socket sends a query to all RESPONDENT sockets and collects responses within a deadline.
 
-### Requirements
+```plantuml
+@startuml
+!theme plain
+title SURVEY Response Collection
+
+participant "Surveyor" as SV
+participant "Respondent A" as RA
+participant "Respondent B" as RB
+participant "Respondent C" as RC
+
+SV -> RA : survey
+SV -> RB : survey
+SV -> RC : survey
+
+RA -> SV : response A
+RB -> SV : response B
+
+note over SV
+  Deadline expires
+  Partial results OK
+end note
+
+@enduml
+```
+
+Table: SURVEY Requirements
 
 | ID | Requirement |
 |----|-------------|
@@ -229,42 +208,6 @@ SURVEY implements request-response fanout. A SURVEYOR socket sends a query to al
 | SV-4 | Survey ID correlates responses to the originating survey |
 | SV-5 | Partial results available when deadline expires |
 
-### State Machines
-
-**SURVEYOR Socket**:
-```
-              ┌──────┐
-              │ IDLE │
-              └──┬───┘
-                 │ Send() (survey)
-                 ▼
-          ┌────────────────┐
-          │ COLLECTING     │◄─── Recv() returns responses
-          └───────┬────────┘
-                  │ deadline or all responded
-                  ▼
-              ┌──────┐
-              │ IDLE │
-              └──────┘
-```
-
-**RESPONDENT Socket**:
-```
-              ┌──────┐
-              │ IDLE │
-              └──┬───┘
-                 │ Recv() (survey)
-                 ▼
-          ┌────────────────┐
-          │ RESPONDING     │
-          └───────┬────────┘
-                  │ Send() (response)
-                  ▼
-              ┌──────┐
-              │ IDLE │
-              └──────┘
-```
-
 ### Design
 
 ```go
@@ -272,30 +215,17 @@ SURVEY implements request-response fanout. A SURVEYOR socket sends a query to al
 type SurveyorSocket struct {
     base       *BaseSocket
     state      atomic.Uint32
-
-    // Survey tracking
     surveyID   atomic.Uint32
     pending    *pendingSurvey
     deadline   time.Duration
-
     peers      *PeerRegistry
 }
 
-// pendingSurvey tracks an active survey.
-type pendingSurvey struct {
-    id         uint32
-    responses  []*Message
-    deadline   time.Time
-    done       chan struct{}
-}
-
 // Send broadcasts a survey to all respondents.
-// Starts the collection period.
 func (s *SurveyorSocket) Send(data []byte) error
 
 // Recv receives the next response to the active survey.
 // Returns ErrTimeout when deadline expires.
-// After timeout, subsequent Recv() calls return ErrInvalidState.
 func (s *SurveyorSocket) Recv() ([]byte, error)
 
 // SetDeadline sets the survey collection deadline.
@@ -316,32 +246,20 @@ func (s *RespondentSocket) Recv() ([]byte, error)
 func (s *RespondentSocket) Send(data []byte) error
 ```
 
----
-
 ## BUS Pattern
 
 ### Overview
 
-BUS provides many-to-many communication. Each BUS socket can send and receive. Messages are delivered to all other connected BUS sockets.
+BUS provides many-to-many communication. Each BUS socket can send and receive. We deliver messages to all other connected BUS sockets.
 
-### Requirements
+Table: BUS Requirements
 
 | ID | Requirement |
 |----|-------------|
 | BU-1 | BUS socket can send and receive messages |
 | BU-2 | Sent messages delivered to all other connected BUS peers |
 | BU-3 | Messages not echoed back to sender |
-| BU-4 | No state machine - always ready to send/receive |
-
-### State Machine
-
-**BUS Socket**: Stateless
-```
-┌──────┐
-│ OPEN │──► Send() broadcasts to all peers
-│      │──► Recv() returns messages from any peer
-└──────┘
-```
+| BU-4 | No state machine (always ready to send/receive) |
 
 ### Design
 
@@ -350,69 +268,31 @@ BUS provides many-to-many communication. Each BUS socket can send and receive. M
 type BusSocket struct {
     base   *BaseSocket
     peers  *PeerRegistry
-
     sendCh chan<- *Message
     recvCh <-chan *Message
 }
 
 // Send broadcasts a message to all connected peers.
-func (s *BusSocket) Send(data []byte) error {
-    msg := s.base.pool.NewMessage(data)
-
-    peers := s.peers.All()
-    for _, peer := range peers {
-        peerMsg := msg.Clone()
-        peerMsg.PeerID = peer.ID
-        s.sendCh <- peerMsg
-    }
-    msg.Release()
-    return nil
-}
+func (s *BusSocket) Send(data []byte) error
 
 // Recv receives a message from any connected peer.
-func (s *BusSocket) Recv() ([]byte, error) {
-    select {
-    case msg := <-s.recvCh:
-        data := make([]byte, len(msg.Data))
-        copy(data, msg.Data)
-        msg.Release()
-        return data, nil
-    case <-s.base.ctx.Done():
-        return nil, ErrClosed
-    }
-}
+func (s *BusSocket) Recv() ([]byte, error)
 ```
-
----
 
 ## PAIR Pattern
 
 ### Overview
 
-PAIR provides exclusive bidirectional communication between exactly two endpoints. Only one peer connection is allowed.
+PAIR provides exclusive bidirectional communication between exactly two endpoints. We allow only one peer connection.
 
-### Requirements
+Table: PAIR Requirements
 
 | ID | Requirement |
 |----|-------------|
 | PA-1 | PAIR socket connects to exactly one peer |
 | PA-2 | Both endpoints can send and receive |
 | PA-3 | Additional connection attempts rejected |
-| PA-4 | No state machine - always ready to send/receive |
-
-### State Machine
-
-**PAIR Socket**: Stateless (but exclusive connection)
-```
-┌──────────────┐
-│ DISCONNECTED │
-└──────┬───────┘
-       │ connect
-       ▼
-┌──────────────┐
-│  CONNECTED   │──► Send()/Recv() available
-└──────────────┘
-```
+| PA-4 | No state machine (always ready to send/receive) |
 
 ### Design
 
@@ -420,71 +300,29 @@ PAIR provides exclusive bidirectional communication between exactly two endpoint
 // PairSocket provides exclusive bidirectional communication.
 type PairSocket struct {
     base   *BaseSocket
-
-    // Exclusive peer
     peerMu sync.Mutex
     peer   *Peer
-
     sendCh chan<- *Message
     recvCh <-chan *Message
 }
 
 // Connect establishes connection to peer.
 // Returns error if already connected.
-func (s *PairSocket) Connect(addr string) error {
-    s.peerMu.Lock()
-    defer s.peerMu.Unlock()
-
-    if s.peer != nil {
-        return ErrAlreadyConnected
-    }
-
-    // Establish connection...
-    return nil
-}
+func (s *PairSocket) Connect(addr string) error
 
 // Send sends a message to the connected peer.
-func (s *PairSocket) Send(data []byte) error {
-    s.peerMu.Lock()
-    peer := s.peer
-    s.peerMu.Unlock()
-
-    if peer == nil {
-        return ErrNotConnected
-    }
-
-    msg := s.base.pool.NewMessage(data)
-    msg.PeerID = peer.ID
-
-    select {
-    case s.sendCh <- msg:
-        return nil
-    case <-s.base.ctx.Done():
-        msg.Release()
-        return ErrClosed
-    }
-}
+func (s *PairSocket) Send(data []byte) error
 
 // Recv receives a message from the connected peer.
-func (s *PairSocket) Recv() ([]byte, error) {
-    select {
-    case msg := <-s.recvCh:
-        data := make([]byte, len(msg.Data))
-        copy(data, msg.Data)
-        msg.Release()
-        return data, nil
-    case <-s.base.ctx.Done():
-        return nil, ErrClosed
-    }
-}
+func (s *PairSocket) Recv() ([]byte, error)
 ```
-
----
 
 ## Protocol Comparison
 
-| Pattern | Topology | Direction | State Machine | Key Feature |
-|---------|----------|-----------|---------------|-------------|
+Table: Protocol Characteristics
+
+| Pattern | Topology | Direction | State Machine | Distinguishing Feature |
+|---------|----------|-----------|---------------|------------------------|
 | REQ/REP | N:1 | Request-Reply | Yes | Correlation |
 | PUB/SUB | 1:N | One-way | No | Topic filtering |
 | PIPELINE | N:M | One-way | No | Load balancing |
@@ -494,7 +332,7 @@ func (s *PairSocket) Recv() ([]byte, error) {
 
 ## Testing Strategy
 
-### Pattern-Specific Tests
+Table: Pattern-Specific Tests
 
 | Pattern | Tests |
 |---------|-------|
@@ -504,33 +342,22 @@ func (s *PairSocket) Recv() ([]byte, error) {
 | BUS | Mesh connectivity, no echo, concurrent send/recv |
 | PAIR | Exclusivity, bidirectional flow, reconnection |
 
-### Integration Tests
-
-| Test | Description |
-|------|-------------|
-| `TestPubSubMultipleSubscribers` | One publisher, many subscribers |
-| `TestPubSubTopicFiltering` | Messages filtered by topic |
-| `TestPipelineLoadBalance` | Work distributed evenly |
-| `TestSurveyPartialResponses` | Some respondents don't reply |
-| `TestBusMesh` | Three nodes, full connectivity |
-| `TestPairExclusivity` | Second connection rejected |
-
 ## Acceptance Criteria
 
-1. **PUB/SUB Implemented**: Broadcast with topic filtering
-2. **PIPELINE Implemented**: Round-robin load balancing
-3. **SURVEY Implemented**: Deadline-based response collection
-4. **BUS Implemented**: Many-to-many mesh
-5. **PAIR Implemented**: Exclusive bidirectional
-6. **State Machines Correct**: All transitions validated
-7. **Tests Pass**: Pattern-specific and integration tests
-8. **Documentation**: GoDoc for all types/methods
+We consider this PRD complete when:
+
+1. PUB/SUB implements broadcast with topic filtering
+2. PIPELINE implements round-robin load balancing
+3. SURVEY implements deadline-based response collection
+4. BUS implements many-to-many mesh
+5. PAIR implements exclusive bidirectional channel
+6. All state machines are validated
+7. Pattern-specific and integration tests pass
+8. GoDoc exists for all types and methods
 
 ## Dependencies
 
-- REQ/REP Protocol Engine (sp-ms6.2) - Base patterns established
-- Shared Infrastructure (sp-ms6.7) - BufferPool, registries
-- I/O Workers (sp-ms6.3) - WorkerPair integration
+We depend on REQ/REP Protocol Engine (sp-ms6.2), Shared Infrastructure (sp-ms6.7), and I/O Workers (sp-ms6.3).
 
 ## References
 

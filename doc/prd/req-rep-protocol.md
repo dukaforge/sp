@@ -1,19 +1,47 @@
 # PRD: REQ/REP Protocol Engine (Phase 1)
 
-**Issue**: sp-ms6.2
-**Status**: Draft
-**Author**: Claude
-**Date**: 2026-01-27
+Issue: sp-ms6.2
+Status: Draft
+Author: Claude
+Date: 2026-01-27
 
 ## Overview
 
-The REQ/REP protocol implements synchronous request-reply messaging. A REQ (requester) socket sends a message and blocks until a REP (replier) socket responds. This is the first protocol pattern implemented in SP, establishing patterns for all subsequent protocols.
+The REQ/REP protocol implements synchronous request-reply messaging. A REQ (requester) socket sends a message and blocks until a REP (replier) socket responds. We implement this pattern first because it establishes foundations for all subsequent protocols.
 
 The protocol guarantees message correlation via request IDs and supports automatic request retry for reliability.
 
+```plantuml
+@startuml
+!theme plain
+title REQ/REP Message Exchange
+
+participant "Application" as App
+participant "REQ Socket" as REQ
+participant "Transport" as T
+participant "REP Socket" as REP
+participant "Server" as Srv
+
+App -> REQ : Send(request)
+REQ -> REQ : Generate request ID
+REQ -> T : Message + Header
+T -> REP : Message + Header
+REP -> REP : Store backtrace
+REP -> Srv : Recv() returns request
+
+Srv -> REP : Send(response)
+REP -> REP : Attach backtrace
+REP -> T : Message + Header
+T -> REQ : Message + Header
+REQ -> REQ : Match request ID
+REQ -> App : Recv() returns response
+
+@enduml
+```
+
 ## Requirements
 
-### Functional Requirements
+Table: Functional Requirements
 
 | ID | Requirement |
 |----|-------------|
@@ -26,88 +54,84 @@ The protocol guarantees message correlation via request IDs and supports automat
 | RR-7 | Both sockets enforce state machine (send/recv ordering) |
 | RR-8 | Multiple peers supported with load balancing (REQ) |
 
-### Non-Functional Requirements
+Table: Non-Functional Requirements
 
 | ID | Requirement |
 |----|-------------|
-| NF-1 | Request-reply latency: < 20μs (local Unix transport) |
+| NF-1 | Request-reply latency below 20μs on local Unix transport |
 | NF-2 | Zero-copy message path where possible |
-| NF-3 | State machine checks: O(1) |
-| NF-4 | Thread safety: all socket operations goroutine-safe |
-| NF-5 | Clean shutdown: no goroutine leaks, pending operations canceled |
+| NF-3 | State machine checks complete in O(1) |
+| NF-4 | All socket operations are goroutine-safe |
+| NF-5 | Clean shutdown with no goroutine leaks, pending operations canceled |
 
 ## Design
 
 ### Protocol State Machines
 
-**REQ Socket States**:
+```plantuml
+@startuml
+!theme plain
+title REQ Socket State Machine
 
-```
-                ┌──────┐
-                │ IDLE │
-                └──┬───┘
-                   │ Send()
-                   ▼
-          ┌─────────────────┐
-          │ REQUEST_SENT    │◄──────┐
-          └───────┬─────────┘       │
-                  │                 │ resend timer
-         Recv() ──┤                 │
-                  │                 │
-                  ▼                 │
-          ┌─────────────────┐       │
-          │ AWAITING_REPLY  │───────┘
-          └───────┬─────────┘
-                  │ reply received
-                  ▼
-                ┌──────┐
-                │ IDLE │
-                └──────┘
-```
+[*] --> IDLE
 
-- `Send()` in IDLE: starts request, arms resend timer
-- `Recv()` in IDLE: returns `ErrInvalidState`
-- `Send()` while awaiting: cancels pending, starts new request
-- Reply received: matches request ID, returns to IDLE
+IDLE --> REQUEST_SENT : Send()
+IDLE : Recv() returns error
 
-**REP Socket States**:
+REQUEST_SENT --> AWAITING_REPLY : message sent
+REQUEST_SENT : arms resend timer
 
-```
-                ┌──────┐
-                │ IDLE │
-                └──┬───┘
-                   │ Recv() (request arrives)
-                   ▼
-          ┌─────────────────┐
-          │ REQUEST_RECEIVED│
-          └───────┬─────────┘
-                  │ Send() (reply)
-                  ▼
-                ┌──────┐
-                │ IDLE │
-                └──────┘
+AWAITING_REPLY --> AWAITING_REPLY : resend timer fires
+AWAITING_REPLY --> IDLE : reply received
+AWAITING_REPLY --> REQUEST_SENT : Send() cancels pending
+
+note right of AWAITING_REPLY
+  Resend on timeout
+  Match reply to request ID
+end note
+
+@enduml
 ```
 
-- `Recv()` in IDLE: blocks until request arrives
-- `Send()` in IDLE: returns `ErrInvalidState`
-- `Send()` after `Recv()`: sends reply using stored backtrace
-- Multiple requests queued while processing previous
+```plantuml
+@startuml
+!theme plain
+title REP Socket State Machine
+
+[*] --> IDLE
+
+IDLE --> REQUEST_RECEIVED : Recv() (request arrives)
+IDLE : Send() returns error
+
+REQUEST_RECEIVED --> IDLE : Send() (reply)
+REQUEST_RECEIVED : stores backtrace for routing
+
+note right of REQUEST_RECEIVED
+  Must send reply before
+  receiving next request
+end note
+
+@enduml
+```
 
 ### Message Header Format
 
-The protocol uses a backtrace header for request-reply correlation:
+We use a backtrace header for request-reply correlation.
 
 ```
 ┌────────────────┬────────────────┬────────────────┐
 │  Peer ID (opt) │  Peer ID (opt) │   Request ID   │
 │  MSB=0         │  MSB=0         │   MSB=1        │
-│  4 bytes BE    │  4 bytes BE    │   4 bytes BE   │
+│  4 bytes BE    │  4 bytes BE    │  4 bytes BE    │
 └────────────────┴────────────────┴────────────────┘
 ```
 
-- **Request ID**: Generated by REQ socket (0x80000000 - 0xFFFFFFFF)
-- **Peer IDs**: For future forwarding devices (0x00000000 - 0x7FFFFFFF)
-- **Big-endian**: Network byte order for all IDs
+Table: Header Components
+
+| Component | Value Range | Purpose |
+|-----------|-------------|---------|
+| Request ID | 0x80000000 - 0xFFFFFFFF | Generated by REQ socket, MSB always set |
+| Peer IDs | 0x00000000 - 0x7FFFFFFF | For future forwarding devices, MSB clear |
 
 ```go
 // Header parsing/building
@@ -184,7 +208,7 @@ func (s *ReqSocket) Send(data []byte) error
 // Recv waits for a reply to the last sent request.
 // Blocks until a reply is received or the request times out.
 // Returns ErrInvalidState if no request is pending.
-// Returns ErrTimeout if the reply doesn't arrive in time.
+// Returns ErrTimeout if the reply does not arrive in time.
 func (s *ReqSocket) Recv() ([]byte, error)
 
 // SendRecv sends a request and waits for the reply.
@@ -199,7 +223,7 @@ func (s *ReqSocket) Close() error
 func (s *ReqSocket) SetResendTime(d time.Duration)
 ```
 
-**REQ Protocol Goroutine**:
+We implement the REQ protocol goroutine as follows:
 
 ```go
 func (s *ReqSocket) run(ctx context.Context) {
@@ -286,31 +310,9 @@ func (s *RepSocket) Send(data []byte) error
 func (s *RepSocket) Close() error
 ```
 
-**REP Protocol Goroutine**:
+We implement the REP Recv and Send methods as follows:
 
 ```go
-func (s *RepSocket) run(ctx context.Context) {
-    defer s.cleanup()
-
-    for {
-        select {
-        case <-ctx.Done():
-            return
-
-        case msg := <-s.recvCh:
-            // Queue incoming request
-            select {
-            case s.requestQueue <- msg:
-                // Queued successfully
-            default:
-                // Queue full, drop message (backpressure)
-                msg.Release()
-            }
-        }
-    }
-}
-
-// Recv implementation
 func (s *RepSocket) Recv() ([]byte, error) {
     select {
     case msg := <-s.requestQueue:
@@ -331,7 +333,6 @@ func (s *RepSocket) Recv() ([]byte, error) {
     }
 }
 
-// Send implementation
 func (s *RepSocket) Send(data []byte) error {
     s.mu.Lock()
     if s.state.Load() != uint32(RepStateRequestReceived) {
@@ -360,7 +361,7 @@ func (s *RepSocket) Send(data []byte) error {
 
 ### Load Balancing (REQ)
 
-When a REQ socket has multiple peers, requests are distributed round-robin:
+When a REQ socket has multiple peers, we distribute requests round-robin:
 
 ```go
 func (s *ReqSocket) selectPeer() (PeerID, error) {
@@ -426,82 +427,61 @@ type RepConfig struct {
 }
 ```
 
-### Integration with I/O Workers
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                       ReqSocket                                  │
-│  ┌────────────────────────────────────────────────────────────┐│
-│  │                Protocol Goroutine                          ││
-│  │  - State machine management                                ││
-│  │  - Request tracking                                        ││
-│  │  - Resend timer                                            ││
-│  │  - Reply correlation                                       ││
-│  └────────────────────────────────────────────────────────────┘│
-│        │ sendCh                              ▲ recvCh          │
-│        ▼                                      │                 │
-│  ┌─────────────────────────────────────────────────────────────┤
-│  │                   WorkerPair                                ││
-│  │        (from I/O Workers layer)                             ││
-│  └─────────────────────────────────────────────────────────────┘│
-└─────────────────────────────────────────────────────────────────┘
-```
-
 ## Testing Strategy
 
-### Unit Tests
+Table: Unit Tests
 
 | Test | Description |
 |------|-------------|
-| `TestReqStateMachine` | State transitions enforced correctly |
-| `TestRepStateMachine` | State transitions enforced correctly |
-| `TestReqSendRecv` | Basic request-reply flow |
-| `TestReqAutoResend` | Automatic resend on timeout |
-| `TestReqCancelPending` | New request cancels pending |
-| `TestReqMultiplePeers` | Round-robin load balancing |
-| `TestRepBacktrace` | Backtrace stored and used for reply |
-| `TestReqRecvTimeout` | Timeout handling |
-| `TestInvalidStateErrors` | Correct errors for wrong state |
-| `TestSocketClose` | Clean shutdown, pending ops canceled |
+| TestReqStateMachine | State transitions enforced correctly |
+| TestRepStateMachine | State transitions enforced correctly |
+| TestReqSendRecv | Basic request-reply flow |
+| TestReqAutoResend | Automatic resend on timeout |
+| TestReqCancelPending | New request cancels pending |
+| TestReqMultiplePeers | Round-robin load balancing |
+| TestRepBacktrace | Backtrace stored and used for reply |
+| TestReqRecvTimeout | Timeout handling |
+| TestInvalidStateErrors | Correct errors for wrong state |
+| TestSocketClose | Clean shutdown, pending ops canceled |
 
-### Integration Tests
+Table: Integration Tests
 
 | Test | Description |
 |------|-------------|
-| `TestReqRepBasic` | Full request-reply with transport |
-| `TestReqRepMultipleExchanges` | Sequential request-reply pairs |
-| `TestReqRepConcurrent` | Multiple REQ sockets to one REP |
-| `TestReqRepUnixTransport` | REQ/REP over Unix sockets |
-| `TestReqRepIPTransport` | REQ/REP over IP sockets |
+| TestReqRepBasic | Full request-reply with transport |
+| TestReqRepMultipleExchanges | Sequential request-reply pairs |
+| TestReqRepConcurrent | Multiple REQ sockets to one REP |
+| TestReqRepUnixTransport | REQ/REP over Unix sockets |
+| TestReqRepIPTransport | REQ/REP over IP sockets |
 
-### Benchmarks
+Table: Benchmarks
 
 | Benchmark | Target |
 |-----------|--------|
-| `BenchmarkReqRepLatency` | < 20μs round-trip (Unix) |
-| `BenchmarkReqRepThroughput` | > 50K req/sec |
-| `BenchmarkReqStateMachine` | < 100ns per transition |
+| BenchmarkReqRepLatency | < 20μs round-trip (Unix) |
+| BenchmarkReqRepThroughput | > 50K req/sec |
+| BenchmarkReqStateMachine | < 100ns per transition |
 
 ## Acceptance Criteria
 
-1. **REQ Socket Implemented**: Send, Recv, state machine, resend timer
-2. **REP Socket Implemented**: Recv, Send, backtrace handling
-3. **State Machines Enforced**: Invalid operations return ErrInvalidState
-4. **Request Correlation**: Request IDs correctly match requests to replies
-5. **Auto-Resend Works**: Requests automatically resent on timeout
-6. **Load Balancing Works**: Requests distributed across peers
-7. **Clean Shutdown**: No goroutine leaks, pending operations canceled
-8. **Benchmarks Pass**: Meet latency and throughput targets
-9. **Documentation**: GoDoc comments on all exported types/methods
+We consider this PRD complete when:
+
+1. REQ Socket implements Send, Recv, state machine, and resend timer
+2. REP Socket implements Recv, Send, and backtrace handling
+3. State machines enforce valid operation ordering
+4. Request IDs correctly match requests to replies
+5. Auto-resend works on configurable timeout
+6. Load balancing distributes requests across peers
+7. Clean shutdown with no goroutine leaks
+8. Benchmarks meet latency and throughput targets
+9. GoDoc comments exist on all exported types and methods
 
 ## Dependencies
 
-- Transport Abstraction Layer (sp-ms6.1) - Transport interface
-- Shared Infrastructure (sp-ms6.7) - BufferPool, PeerRegistry, Message
-- I/O Workers (sp-ms6.3) - WorkerPair
+We depend on the Transport Abstraction Layer (sp-ms6.1), Shared Infrastructure (sp-ms6.7), and I/O Workers (sp-ms6.3).
 
 ## References
 
 - [NNG REQ/REP Documentation](https://nng.nanomsg.org/man/tip/nng_req.7.html)
-- SP ARCHITECTURE.md - Protocol Engine section
-- BACKGROUND/nng/nng-request-reply.md - NNG reference
+- SP ARCHITECTURE.md, Protocol Engine section
+- BACKGROUND/nng/nng-request-reply.md

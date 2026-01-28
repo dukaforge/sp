@@ -1,17 +1,56 @@
 # PRD: I/O Workers
 
-**Issue**: sp-ms6.3
-**Status**: Draft
-**Author**: Claude
-**Date**: 2026-01-27
+Issue: sp-ms6.3
+Status: Draft
+Author: Claude
+Date: 2026-01-27
 
 ## Overview
 
 I/O Workers are dedicated goroutines that handle raw syscall operations for transport communication. Each socket has exactly one recv worker and one send worker, isolating I/O operations from protocol logic. Workers communicate with the protocol engine via channels, providing natural backpressure and clean separation of concerns.
 
+```plantuml
+@startuml
+!theme plain
+title I/O Worker Architecture
+
+package "Socket" {
+  package "Protocol Engine" {
+    [Protocol\nGoroutine]
+  }
+
+  package "I/O Workers" {
+    [RecvWorker] as RW
+    [SendWorker] as SW
+  }
+
+  [Transport]
+}
+
+[Protocol\nGoroutine] <-down- RW : recvCh
+[Protocol\nGoroutine] -down-> SW : sendCh
+
+RW <-down- [Transport] : Recv()
+SW -down-> [Transport] : Send()
+
+note right of RW
+  One goroutine per socket
+  Reads from transport
+  Delivers to protocol
+end note
+
+note right of SW
+  One goroutine per socket
+  Receives from protocol
+  Writes to transport
+end note
+
+@enduml
+```
+
 ## Requirements
 
-### Functional Requirements
+Table: Functional Requirements
 
 | ID | Requirement |
 |----|-------------|
@@ -22,41 +61,17 @@ I/O Workers are dedicated goroutines that handle raw syscall operations for tran
 | IO-5 | Workers respect socket close and shutdown cleanly |
 | IO-6 | Workers preserve message boundaries from transport layer |
 
-### Non-Functional Requirements
+Table: Non-Functional Requirements
 
 | ID | Requirement |
 |----|-------------|
-| NF-1 | Worker startup: < 1ms from socket open to ready |
-| NF-2 | Worker shutdown: < 100ms with graceful drain |
+| NF-1 | Worker startup below 1ms from socket open to ready |
+| NF-2 | Worker shutdown below 100ms with graceful drain |
 | NF-3 | Zero-copy message handoff where possible |
 | NF-4 | No goroutine leaks on socket close |
 | NF-5 | No blocking of protocol engine on transport slowness |
 
 ## Design
-
-### Worker Architecture
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                          Socket                                   │
-│  ┌────────────────────────────────────────────────────────────┐ │
-│  │                    Protocol Engine                          │ │
-│  │           (protocol-specific goroutines)                    │ │
-│  └────────────────────────────────────────────────────────────┘ │
-│            │ sendCh                          ▲ recvCh           │
-│            ▼                                  │                  │
-│  ┌─────────────────┐              ┌─────────────────┐          │
-│  │   Send Worker   │              │   Recv Worker   │          │
-│  │   (goroutine)   │              │   (goroutine)   │          │
-│  └─────────────────┘              └─────────────────┘          │
-│            │                                  ▲                  │
-│            ▼                                  │                  │
-│  ┌────────────────────────────────────────────────────────────┐ │
-│  │                      Transport                              │ │
-│  │              (Unix socket or IP socket)                     │ │
-│  └────────────────────────────────────────────────────────────┘ │
-└──────────────────────────────────────────────────────────────────┘
-```
 
 ### Recv Worker
 
@@ -95,7 +110,7 @@ func (w *RecvWorker) Stop()
 func (w *RecvWorker) Stats() RecvWorkerStats
 ```
 
-**Recv Worker Loop**:
+We implement the recv worker loop as follows:
 
 ```go
 func (w *RecvWorker) run() {
@@ -178,7 +193,7 @@ func (w *SendWorker) Stop()
 func (w *SendWorker) Stats() SendWorkerStats
 ```
 
-**Send Worker Loop**:
+We implement the send worker loop as follows:
 
 ```go
 func (w *SendWorker) run() {
@@ -270,18 +285,14 @@ func (wp *WorkerPair) Stats() WorkerPairStats
 
 ### Channel Sizing and Backpressure
 
+Table: Channel Configuration
+
 | Channel | Buffer Size | Rationale |
 |---------|-------------|-----------|
 | recvCh | 16 messages | Absorbs recv bursts while protocol processes |
 | sendCh | 16 messages | Allows protocol to queue sends without blocking |
 
-**Backpressure behavior**:
-
-1. **Recv backpressure**: If protocol is slow, recvCh fills up. Recv worker blocks on channel send, which applies backpressure to the network (recv syscall blocks).
-
-2. **Send backpressure**: If transport is slow, send worker blocks on syscall. sendCh fills up, and protocol blocks when sending.
-
-This is intentional—natural flow control without explicit signaling.
+We rely on channel backpressure for flow control. If the protocol engine processes slowly, recvCh fills and the recv worker blocks on channel send, which applies backpressure to the network as the recv syscall blocks. If the transport is slow, the send worker blocks on syscall, sendCh fills, and the protocol blocks when sending. This provides natural flow control without explicit signaling.
 
 ### Error Handling
 
@@ -301,11 +312,11 @@ func isClosed(err error) bool     // True for closed connection
 func isTemporary(err error) bool  // True for EAGAIN, EINTR, etc.
 ```
 
-**Error handling strategy**:
+Table: Error Handling Strategy
 
 | Error Type | Recv Worker Action | Send Worker Action |
 |------------|-------------------|-------------------|
-| Timeout | Continue (retry recv) | N/A (channels don't timeout) |
+| Timeout | Continue (retry recv) | N/A (channels do not timeout) |
 | Closed | Exit worker | Exit worker |
 | Temporary | Retry immediately | Retry immediately |
 | Permanent | Log, increment error counter, continue | Log, increment error counter, drop message |
@@ -338,32 +349,39 @@ func DefaultWorkerConfig() WorkerConfig
 
 ### Lifecycle State Machine
 
-```
-                    ┌─────────┐
-                    │ Created │
-                    └────┬────┘
-                         │ Start()
-                         ▼
-                    ┌─────────┐
-             ┌──────│ Running │◄─────┐
-             │      └────┬────┘      │
-             │           │           │
-    transport│      Stop()│      error
-      closed │           │      (retry)
-             │           ▼           │
-             │      ┌─────────┐      │
-             └─────►│Stopping │──────┘
-                    └────┬────┘
-                         │ drain complete
-                         ▼
-                    ┌─────────┐
-                    │ Stopped │
-                    └─────────┘
+```plantuml
+@startuml
+!theme plain
+title Worker Lifecycle States
+
+[*] --> Created : NewWorkerPair()
+
+Created --> Running : Start()
+
+Running --> Running : recv/send operations
+
+Running --> Stopping : Stop() or\ncontext cancel
+
+Stopping --> Stopped : drain complete
+
+Stopped --> [*]
+
+note right of Running
+  Both goroutines active
+  Processing messages
+end note
+
+note right of Stopping
+  Draining sendCh
+  Waiting for goroutines
+end note
+
+@enduml
 ```
 
 ### Integration with Connection Registry
 
-When a connection is registered, a WorkerPair is created and started:
+When a connection registers, we create and start a WorkerPair:
 
 ```go
 // In ConnRegistry.Register:
@@ -393,56 +411,57 @@ func (r *ConnRegistry) Unregister(id ConnID) bool {
 
 ## Testing Strategy
 
-### Unit Tests
+Table: Unit Tests
 
 | Test | Description |
 |------|-------------|
-| `TestRecvWorkerBasic` | Recv worker delivers messages to channel |
-| `TestRecvWorkerTimeout` | Recv worker handles read timeouts gracefully |
-| `TestRecvWorkerClose` | Recv worker exits on transport close |
-| `TestRecvWorkerShutdown` | Recv worker stops on context cancel |
-| `TestSendWorkerBasic` | Send worker writes messages from channel |
-| `TestSendWorkerDrain` | Send worker drains pending messages on shutdown |
-| `TestSendWorkerClose` | Send worker handles transport close |
-| `TestWorkerPairLifecycle` | Start and stop both workers correctly |
-| `TestBackpressure` | Full channel blocks sender appropriately |
-| `TestNoGoroutineLeak` | All goroutines exit on socket close |
+| TestRecvWorkerBasic | Recv worker delivers messages to channel |
+| TestRecvWorkerTimeout | Recv worker handles read timeouts gracefully |
+| TestRecvWorkerClose | Recv worker exits on transport close |
+| TestRecvWorkerShutdown | Recv worker stops on context cancel |
+| TestSendWorkerBasic | Send worker writes messages from channel |
+| TestSendWorkerDrain | Send worker drains pending messages on shutdown |
+| TestSendWorkerClose | Send worker handles transport close |
+| TestWorkerPairLifecycle | Start and stop both workers correctly |
+| TestBackpressure | Full channel blocks sender appropriately |
+| TestNoGoroutineLeak | All goroutines exit on socket close |
 
-### Integration Tests
+Table: Integration Tests
 
 | Test | Description |
 |------|-------------|
-| `TestWorkerTransportIntegration` | Workers with real Unix transport |
-| `TestWorkerProtocolHandoff` | Message flow from transport to protocol |
-| `TestConcurrentConnections` | Multiple worker pairs simultaneously |
+| TestWorkerTransportIntegration | Workers with real Unix transport |
+| TestWorkerProtocolHandoff | Message flow from transport to protocol |
+| TestConcurrentConnections | Multiple worker pairs simultaneously |
 
-### Benchmarks
+Table: Benchmarks
 
 | Benchmark | Target |
 |-----------|--------|
-| `BenchmarkRecvWorkerThroughput` | > 500K msg/sec (empty messages) |
-| `BenchmarkSendWorkerThroughput` | > 500K msg/sec (empty messages) |
-| `BenchmarkWorkerLatency` | < 5μs channel-to-channel |
-| `BenchmarkWorkerStartStop` | < 1ms start, < 100ms stop |
+| BenchmarkRecvWorkerThroughput | > 500K msg/sec (empty messages) |
+| BenchmarkSendWorkerThroughput | > 500K msg/sec (empty messages) |
+| BenchmarkWorkerLatency | < 5μs channel-to-channel |
+| BenchmarkWorkerStartStop | < 1ms start, < 100ms stop |
 
 ## Acceptance Criteria
 
-1. **RecvWorker Implemented**: Continuous read loop with shutdown handling
-2. **SendWorker Implemented**: Channel-driven write loop with drain
-3. **WorkerPair Implemented**: Unified lifecycle management
-4. **Backpressure Works**: Channel fullness applies flow control
-5. **Clean Shutdown**: No goroutine leaks, graceful drain
-6. **Error Handling**: Timeout/closed/temporary errors handled correctly
-7. **Benchmarks Pass**: Meet throughput and latency targets
-8. **Documentation**: GoDoc comments on all exported types/methods
+We consider this PRD complete when:
+
+1. RecvWorker implements continuous read loop with shutdown handling
+2. SendWorker implements channel-driven write loop with drain
+3. WorkerPair provides unified lifecycle management
+4. Backpressure works via channel fullness
+5. Shutdown completes cleanly with no goroutine leaks
+6. Error handling covers timeout, closed, and temporary errors
+7. Benchmarks meet throughput and latency targets
+8. GoDoc comments exist on all exported types and methods
 
 ## Dependencies
 
-- Transport Abstraction Layer (sp-ms6.1) - Transport interface
-- Shared Infrastructure (sp-ms6.7) - BufferPool, Message type
+We depend on the Transport Abstraction Layer (sp-ms6.1) for the Transport interface and Shared Infrastructure (sp-ms6.7) for BufferPool and Message types.
 
 ## References
 
-- SP ARCHITECTURE.md - I/O Workers section
+- SP ARCHITECTURE.md, I/O Workers section
 - [Go context package](https://pkg.go.dev/context)
 - [Go channels](https://go.dev/doc/effective_go#channels)
