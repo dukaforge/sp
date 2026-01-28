@@ -20,10 +20,12 @@ After implementation:
 1. Run any tests to verify your work
 2. Calculate tokens used (starting tokens - current tokens from context)
 3. Log token usage and close issue:
+
    ```bash
    bd comments add <issue-id> "tokens: <count>"
    bd close <issue-id>
    ```
+
 4. Commit your changes AND the .beads/issues.jsonl file together:
 
    ```bash
@@ -34,6 +36,7 @@ After implementation:
 5. If you discovered new work or issues, file them in Beads
 
 IMPORTANT: 
+
 - Always commit .beads/issues.jsonl along with your code changes
 - Track token usage for every issue closed
 - Issue status changes need to be committed too!
