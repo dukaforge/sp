@@ -344,12 +344,21 @@ sp/
 │   ├── VISION.md               # Project goals and non-goals
 │   ├── ARCHITECTURE.md         # System design (this file)
 │   ├── prd/                    # Product Requirements Documents
-│   │   ├── req-rep-protocol.md # REQ/REP pattern specification
-│   │   ├── pub-sub-protocol.md # PUB/SUB pattern specification
-│   │   ├── pipeline-protocol.md # PIPELINE pattern specification
-│   │   ├── survey-protocol.md  # SURVEY pattern specification
-│   │   ├── bus-protocol.md     # BUS pattern specification
-│   │   └── pair-protocol.md    # PAIR pattern specification
+│   │   ├── protocols/          # Protocol pattern specifications
+│   │   │   ├── req-rep-protocol.md
+│   │   │   ├── pub-sub-protocol.md
+│   │   │   ├── pipeline-protocol.md
+│   │   │   ├── survey-protocol.md
+│   │   │   ├── bus-protocol.md
+│   │   │   └── pair-protocol.md
+│   │   ├── infrastructure/     # Core infrastructure specs
+│   │   │   ├── transport-abstraction.md
+│   │   │   ├── shared-infrastructure.md
+│   │   │   ├── io-workers.md
+│   │   │   └── socket-api.md
+│   │   └── api/                # API and testing specs
+│   │       ├── async-api.md
+│   │       └── testing-strategy.md
 │   └── BACKGROUND/
 │       └── nng/                # Scalability Protocol reference docs
 │
