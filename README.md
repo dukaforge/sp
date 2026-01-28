@@ -71,7 +71,14 @@ SP addresses specific needs in agent coordination:
 
 - [VISION.md](doc/VISION.md) - Project goals and non-goals
 - [ARCHITECTURE.md](doc/ARCHITECTURE.md) - System design and component overview
-- [PRDs](doc/prd/) - Detailed specifications for each component
+
+### Product Requirements Documents
+
+| Category                                   | Documents                                                             |
+|--------------------------------------------|-----------------------------------------------------------------------|
+| [Protocols](doc/prd/protocols/)            | REQ/REP, PUB/SUB, PIPELINE, SURVEY, BUS, PAIR pattern specifications  |
+| [Infrastructure](doc/prd/infrastructure/)  | Transport abstraction, shared infrastructure, I/O workers, socket API |
+| [API](doc/prd/api/)                        | Async API design, testing strategy                                    |
 
 ## Project Status
 
